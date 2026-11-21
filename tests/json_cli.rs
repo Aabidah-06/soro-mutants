@@ -96,4 +96,52 @@ fn test_json_records_execution_context_without_host_inventory() {
     assert!(metadata.get("hostname").is_none());
     assert!(metadata.get("target_dir").is_none());
     assert_eq!(report["results"][0]["mutant"]["id"], "M0001");
+    assert!(metadata["file_filter"].is_null());
+    assert!(metadata["shard_index"].is_null());
+    assert!(metadata["shard_total"].is_null());
+}
+
+#[test]
+fn list_and_test_json_record_file_and_shard_selection() {
+    let selection_args = [
+        "--file",
+        "src/not-selected.rs",
+        "--shard",
+        "2/3",
+        "--json",
+    ];
+
+    let list = run("list", &selection_args);
+    assert!(list.status.success());
+    let list_report: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(
+        list_report["metadata"],
+        serde_json::json!({
+            "file_filter": "src/not-selected.rs",
+            "shard_index": 2,
+            "shard_total": 3
+        })
+    );
+
+    let test = run(
+        "test",
+        &[
+            "--file",
+            "src/not-selected.rs",
+            "--shard",
+            "2/3",
+            "--test-command",
+            "true",
+            "--json",
+        ],
+    );
+    assert!(test.status.success());
+    let test_report: serde_json::Value = serde_json::from_slice(&test.stdout).unwrap();
+    assert_eq!(
+        test_report["metadata"]["file_filter"],
+        "src/not-selected.rs"
+    );
+    assert_eq!(test_report["metadata"]["shard_index"], 2);
+    assert_eq!(test_report["metadata"]["shard_total"], 3);
+    assert_eq!(test_report["results"], serde_json::json!([]));
 }

@@ -471,6 +471,8 @@ struct ListReport<'a> {
     schema_version: u32,
     mutants: &'a [Mutant],
     #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<SelectionMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     suppression: Option<SuppressionSummary<'a>>,
 }
 
@@ -500,16 +502,49 @@ struct RunMetadata {
     test_command: String,
     compile_timeout_seconds: u64,
     test_timeout_seconds: u64,
+    #[serde(flatten)]
+    selection: SelectionMetadata,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SelectionMetadata {
+    file_filter: Option<String>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
+}
+
+impl SelectionMetadata {
+    fn capture(file_filter: Option<&str>, shard: Option<Shard>) -> Option<Self> {
+        if file_filter.is_none() && shard.is_none() {
+            return None;
+        }
+
+        Some(Self {
+            file_filter: file_filter.map(str::to_owned),
+            shard_index: shard.map(|value| value.index),
+            shard_total: shard.map(|value| value.total),
+        })
+    }
 }
 
 impl RunMetadata {
-    fn capture(test_command: &str, timeouts: Timeouts) -> Self {
+    fn capture(
+        test_command: &str,
+        timeouts: Timeouts,
+        file_filter: Option<&str>,
+        shard: Option<Shard>,
+    ) -> Self {
         Self {
             rustc_version: tool_version("rustc"),
             cargo_version: tool_version("cargo"),
             test_command: redact_environment_secrets(test_command),
             compile_timeout_seconds: timeouts.compile,
             test_timeout_seconds: timeouts.test,
+            selection: SelectionMetadata {
+                file_filter: file_filter.map(str::to_owned),
+                shard_index: shard.map(|value| value.index),
+                shard_total: shard.map(|value| value.total),
+            },
         }
     }
 }
@@ -1166,10 +1201,14 @@ fn resolve_package_filter(root: &Path, selected: &[String]) -> Result<Option<Vec
     Ok(Some(selected_dirs))
 }
 
-fn list_report(mutants: &[Mutant]) -> ListReport<'_> {
+fn list_report(
+    mutants: &[Mutant],
+    metadata: Option<SelectionMetadata>,
+) -> ListReport<'_> {
     ListReport {
         schema_version: JSON_SCHEMA_VERSION,
         mutants,
+        metadata,
         suppression: None,
     }
 }
@@ -2383,7 +2422,10 @@ fn run() -> Result<()> {
                             count: suppressed.len(),
                             details: &suppressed,
                         }),
-                        ..list_report(&mutants)
+                        ..list_report(
+                            &mutants,
+                            SelectionMetadata::capture(file.as_deref(), shard),
+                        )
                     })?
                 )?;
             } else {
@@ -2447,7 +2489,8 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            let metadata = RunMetadata::capture(&test_command, timeouts);
+            let metadata =
+                RunMetadata::capture(&test_command, timeouts, file.as_deref(), shard);
             let root = path
                 .canonicalize()
                 .with_context(|| format!("cannot resolve {}", path.display()))?;
@@ -5653,24 +5696,42 @@ fn compile_command_for(test_command: &str) -> Option<String> {
 fn apply_mutant(root: &Path, mutant: &Mutant) -> Result<()> {
     let path = root.join(&mutant.file);
     let source = read_rust_source(&path)?;
-    if mutant.end_byte > source.len() || mutant.start_byte >= mutant.end_byte {
-        bail!("invalid source span for {}", mutant.id);
-    }
-
-    if source[mutant.start_byte..mutant.end_byte] != mutant.original {
-        bail!(
-            "source changed before applying {} at {}",
-            mutant.id,
-            mutant.file.display()
-        );
-    }
-
-    let mut mutated = String::with_capacity(source.len() + mutant.replacement.len());
-    mutated.push_str(&source[..mutant.start_byte]);
-    mutated.push_str(&mutant.replacement);
-    mutated.push_str(&source[mutant.end_byte..]);
+    let mutated = replace_source_range(
+        &source,
+        mutant.start_byte,
+        mutant.end_byte,
+        &mutant.original,
+        &mutant.replacement,
+    )
+    .with_context(|| format!("cannot apply {} at {}", mutant.id, mutant.file.display()))?;
     fs::write(path, mutated)?;
     Ok(())
+}
+
+fn replace_source_range(
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    expected: &str,
+    replacement: &str,
+) -> Result<String> {
+    if start_byte >= end_byte
+        || end_byte > source.len()
+        || !source.is_char_boundary(start_byte)
+        || !source.is_char_boundary(end_byte)
+    {
+        bail!("invalid UTF-8 source span {start_byte}..{end_byte}");
+    }
+
+    if &source[start_byte..end_byte] != expected {
+        bail!("source text does not match the selected mutation range");
+    }
+
+    let mut mutated = String::with_capacity(source.len() + replacement.len());
+    mutated.push_str(&source[..start_byte]);
+    mutated.push_str(replacement);
+    mutated.push_str(&source[end_byte..]);
+    Ok(mutated)
 }
 
 fn run_process(
@@ -6339,6 +6400,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn property_source_replacements_preserve_bytes_outside_selected_range() {
+        const CHARS: &[char] = &['a', 'Z', '0', ' ', '\n', 'é', 'λ', '🦀'];
+        let mut state = 0x7f4a_7c15_d1ce_4e5b_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) as usize
+        };
+
+        for case in 0..256 {
+            let source_len = 2 + next() % 39;
+            let source: String = (0..source_len)
+                .map(|_| CHARS[next() % CHARS.len()])
+                .collect();
+            let boundaries: Vec<usize> = source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(source.len()))
+                .collect();
+            let start_index = next() % (boundaries.len() - 1);
+            let end_index = start_index + 1 + next() % (boundaries.len() - start_index - 1);
+            let start_byte = boundaries[start_index];
+            let end_byte = boundaries[end_index];
+            let replacement: String = (0..next() % 9)
+                .map(|_| CHARS[next() % CHARS.len()])
+                .collect();
+            let mutated = replace_source_range(
+                &source,
+                start_byte,
+                end_byte,
+                &source[start_byte..end_byte],
+                &replacement,
+            )
+            .expect("generated valid source ranges should be replaceable");
+
+            assert_eq!(
+                &mutated.as_bytes()[..start_byte],
+                &source.as_bytes()[..start_byte],
+                "prefix changed outside case {case}"
+            );
+            assert_eq!(
+                &mutated.as_bytes()[start_byte + replacement.len()..],
+                &source.as_bytes()[end_byte..],
+                "suffix changed outside case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_replacement_rejects_invalid_utf8_boundaries_and_stale_text() {
+        assert!(replace_source_range("aλb", 2, 3, "λ", "x").is_err());
+        assert!(replace_source_range("abc", 1, 4, "bc", "x").is_err());
+        assert!(replace_source_range("abc", 1, 2, "x", "y").is_err());
+    }
+
     fn report_mutant() -> Mutant {
         Mutant {
             id: "M0001".into(),
@@ -6382,7 +6498,7 @@ mod tests {
     #[test]
     fn json_list_preserves_mutant_fields() {
         let mutants = [report_mutant()];
-        let report = serde_json::to_value(list_report(&mutants)).unwrap();
+        let report = serde_json::to_value(list_report(&mutants, None)).unwrap();
         assert_eq!(
             report,
             serde_json::json!({
@@ -6398,7 +6514,7 @@ mod tests {
         );
         let mut mutant = report_mutant();
         mutant.function = None;
-        let report = serde_json::to_value(list_report(&[mutant])).unwrap();
+        let report = serde_json::to_value(list_report(&[mutant], None)).unwrap();
         assert!(report["mutants"][0]["function"].is_null());
     }
 
@@ -6450,7 +6566,7 @@ mod tests {
     #[test]
     fn empty_json_reports_are_versioned() {
         assert_eq!(
-            serde_json::to_value(list_report(&[])).unwrap(),
+            serde_json::to_value(list_report(&[], None)).unwrap(),
             serde_json::json!({"schema_version": 1, "mutants": []})
         );
         assert_eq!(

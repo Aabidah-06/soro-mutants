@@ -4,12 +4,17 @@ Both `list --json` and `test --json` emit an object with the integer
 `schema_version`, currently `1`. This version describes the JSON contract and is
 independent of the package version. Text output is unchanged.
 
-`list` returns `{"schema_version": 1, "mutants": [...]}`. Each mutant retains
+`list` returns `{"schema_version": 1, "mutants": [...]}`. When `--file` or
+`--shard` is active, it also includes `metadata` with the effective
+`file_filter`, `shard_index`, and `shard_total` values. Each mutant retains
 `id`, `operator`, `file`, `function` (a string or null), `span` (`line`, `column`,
 `end_line`, `end_column`), `original`, `replacement`, and `description`.
 Internal byte offsets are not serialized.
 
-`test` returns `{"schema_version": 1, "results": [...], "metadata": {...}}`. Each result contains
+`test` returns `{"schema_version": 1, "results": [...], "metadata": {...}}`. Its
+metadata includes nullable `file_filter`, `shard_index`, and `shard_total`
+fields, allowing reports to identify the active selection (`shard_index` is
+one-based). Each result contains
 `mutant` with those same fields and `outcome`, one of `KILLED`, `SURVIVED`,
 `UNVIABLE`, or `TIMEOUT`. See the [illustrative legacy report](json-report-example.json).
 The additional `metadata` object records `rustc_version` and `cargo_version` (strings,
@@ -57,6 +62,9 @@ To enable robust client-side deserialization, the following field guarantees app
 | `metadata.test_command` | `metadata` | Required | String | Configured test command after environment-secret redaction. Never `null`. |
 | `metadata.compile_timeout_seconds` | `metadata` | Required | Integer | Non-negative effective compilation timeout in seconds. Never `null`. |
 | `metadata.test_timeout_seconds` | `metadata` | Required | Integer | Non-negative effective test execution timeout in seconds. Never `null`. |
+| `metadata.file_filter` | `metadata` | Required for test; conditional for list | String or `null` | The active `--file` suffix filter, or `null` when not specified. |
+| `metadata.shard_index` | `metadata` | Required for test; conditional for list | Integer or `null` | One-based active shard index, or `null` when `--shard` is not specified. |
+| `metadata.shard_total` | `metadata` | Required for test; conditional for list | Integer or `null` | Total shard count, or `null` when `--shard` is not specified. |
 | `suppression` | `test --json` root | Optional | Object | Omitted / absent when no mutants are suppressed. Contains `count` (integer) and `details` (array) when present. |
 | `mutant.id` | Mutant object | Required | String | Non-empty deterministic identifier (e.g. `"M0001"`). Never `null`. |
 | `mutant.operator` | Mutant object | Required | String | Non-empty operator code (e.g. `"AUTH-001"`). Never `null`. |
