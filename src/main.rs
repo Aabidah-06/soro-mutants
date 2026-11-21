@@ -6577,6 +6577,99 @@ mod tests {
         );
     }
 
+    fn runner_cleanup_unit_fixture(replacement: &str) -> (PathBuf, Mutant) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "soro-runner-cleanup-unit-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"cleanup-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let source = "pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value_is_one() { assert_eq!(super::value(), 1); }\n}\n";
+        fs::write(root.join("src/lib.rs"), source).unwrap();
+        let marker = "{ 1 }";
+        let start_byte = source.find(marker).unwrap() + 2;
+        let mutant = Mutant {
+            id: "M-CLEANUP".into(),
+            operator: "TEST".into(),
+            file: PathBuf::from("src/lib.rs"),
+            function: Some("value".into()),
+            span: SourceSpan {
+                line: 1,
+                column: 24,
+                end_line: 1,
+                end_column: 25,
+            },
+            original: "1".into(),
+            replacement: replacement.into(),
+            description: "cleanup regression".into(),
+            start_byte,
+            end_byte: start_byte + 1,
+        };
+        (root, mutant)
+    }
+
+    #[test]
+    fn execute_mutant_cleans_scratch_after_compile_failure() {
+        let (root, mutant) = runner_cleanup_unit_fixture("unknown_symbol");
+        let scratch = root.join(".soro-mutants-worktree");
+        let target = root.join(".soro-mutants-target").join("unit-compile-failure");
+        let outcome = execute_mutant(
+            &root,
+            &mutant,
+            None,
+            "cargo test -q",
+            Timeouts {
+                compile: 60,
+                test: 60,
+            },
+            &scratch,
+            &target,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Unviable);
+        assert!(!scratch.exists(), "scratch worktree must be removed");
+        assert!(fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("pub fn value() -> i32 { 1 }"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_mutant_cleans_scratch_after_test_failure() {
+        let (root, mutant) = runner_cleanup_unit_fixture("2");
+        let scratch = root.join(".soro-mutants-worktree");
+        let target = root.join(".soro-mutants-target").join("unit-test-failure");
+        let outcome = execute_mutant(
+            &root,
+            &mutant,
+            None,
+            "cargo test -q",
+            Timeouts {
+                compile: 60,
+                test: 60,
+            },
+            &scratch,
+            &target,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Killed);
+        assert!(!scratch.exists(), "scratch worktree must be removed");
+        assert!(fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("pub fn value() -> i32 { 1 }"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn nextest_runner_rejects_an_ambiguous_custom_command() {
         assert!(
