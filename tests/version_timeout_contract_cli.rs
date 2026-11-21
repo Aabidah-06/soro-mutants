@@ -32,7 +32,12 @@ fn negative_timeout_flags_are_usage_errors() {
 
 #[test]
 fn malformed_timeout_is_a_usage_error() {
-    let output = run(&["test", "fixtures/weak-auth", "--test-timeout", "not-a-number"]);
+    let output = run(&[
+        "test",
+        "fixtures/weak-auth",
+        "--test-timeout",
+        "not-a-number",
+    ]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("non-negative integer"));

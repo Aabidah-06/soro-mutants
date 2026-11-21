@@ -34,7 +34,9 @@ use filters::{
 /// Parse CLI timeout seconds with an actionable error for negative values.
 fn parse_timeout_seconds(raw: &str) -> std::result::Result<u64, String> {
     if raw.starts_with('-') {
-        return Err(format!("timeout must be a non-negative number of seconds, got {raw}"));
+        return Err(format!(
+            "timeout must be a non-negative number of seconds, got {raw}"
+        ));
     }
     raw.parse::<u64>()
         .map_err(|_| format!("timeout must be a non-negative integer number of seconds, got {raw}"))
@@ -6723,7 +6725,9 @@ mod tests {
     fn execute_mutant_cleans_scratch_after_compile_failure() {
         let (root, mutant) = runner_cleanup_unit_fixture("unknown_symbol");
         let scratch = root.join(".soro-mutants-worktree");
-        let target = root.join(".soro-mutants-target").join("unit-compile-failure");
+        let target = root
+            .join(".soro-mutants-target")
+            .join("unit-compile-failure");
         let outcome = execute_mutant(
             &root,
             &mutant,
