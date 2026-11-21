@@ -103,13 +103,7 @@ fn test_json_records_execution_context_without_host_inventory() {
 
 #[test]
 fn list_and_test_json_record_file_and_shard_selection() {
-    let selection_args = [
-        "--file",
-        "src/not-selected.rs",
-        "--shard",
-        "2/3",
-        "--json",
-    ];
+    let selection_args = ["--file", "src/not-selected.rs", "--shard", "2/3", "--json"];
 
     let list = run("list", &selection_args);
     assert!(list.status.success());
