@@ -52,3 +52,27 @@ fn benchmark_negative_timeout_is_a_usage_error() {
     assert!(stderr.contains("non-negative"), "{stderr}");
     assert!(stderr.contains("--timeout"), "{stderr}");
 }
+
+#[test]
+fn non_negative_timeout_values_are_accepted() {
+    for (flag, value) in [
+        ("--timeout", "0"),
+        ("--compile-timeout", "0"),
+        ("--test-timeout", "5"),
+    ] {
+        let output = run(&[
+            "test",
+            "fixtures/weak-auth",
+            "--operator",
+            "TOKEN-001",
+            flag,
+            value,
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{flag}={value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
