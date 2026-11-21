@@ -37,7 +37,9 @@ jobs:
           path: mutation-results.json
 ```
 
-The report is written before an unmet threshold exits with code 4. A baseline
+Add `--no-progress` to keep the job log to the final summary, and see
+[monorepo invocation patterns](monorepo.md) when the repository holds several
+projects. The report is written before an unmet threshold exits with code 4. A baseline
 failure exits with code 3 and may leave an empty report file. Check the run
 status before consuming an artifact. With no viable results, the CLI score is
 0%, so a positive threshold fails. The job summary shows counts and surviving

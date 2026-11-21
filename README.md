@@ -195,6 +195,8 @@ cargo soro-mutants list /path/to/workspace -p my-contract
 cargo soro-mutants test /path/to/workspace -p contract-a -p contract-b
 ```
 
+For repositories with several workspaces or standalone projects, see the [monorepo invocation patterns](docs/monorepo.md).
+
 Unselected packages in the workspace are completely excluded from mutation discovery.
 During test execution:
 - When using the default test command (`cargo test -q`), `-p <package>` is automatically appended for each selected package for both baseline and mutant test execution.
@@ -313,6 +315,12 @@ cargo soro-mutants test . --min-score 80 --github-summary
 ```
 
 `PERCENT` is a finite number from 0 through 100, inclusive (fractional thresholds are accepted). The score is `100 × KILLED / (KILLED + SURVIVED)`; `UNVIABLE` and `TIMEOUT` results are counted in the report but **excluded** from that denominator. With no viable mutants, the score is defined as **0%**: threshold 0 passes, while any positive threshold fails. Equality to the threshold passes. The full report is written before the threshold is evaluated, including JSON, Markdown, output files, and an optional GitHub Actions job summary. Omitting `--min-score` preserves existing exit behavior.
+
+### Quiet output and diagnostics for CI
+
+Pass `--no-progress` to `test` to omit the `Baseline` lines and the per-mutant progress lines from the text report; only the final summary is printed. JSON, Markdown, HTML, and SARIF output, exit codes, and `--output` are unchanged.
+
+Diagnostics go to stderr with a lowercase `error: `, `warning: `, or `note: ` prefix, and reports go to stdout or `--output`. When a selection is empty, stderr lists the active filters and says whether the result is a valid empty selection or a possible discovery problem (no Rust sources, or files that failed to parse). Releases before this one printed fatal errors as `Error: ...`. See [troubleshooting](docs/troubleshooting.md#message-format).
 
 ### Exit codes for CI
 
@@ -470,6 +478,7 @@ See [docs/benchmark.md](docs/benchmark.md) for exact commands, commit hashes, ex
 - [Supported-platform policy](docs/supported-platforms.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [CI integration](docs/ci-integration.md)
+- [Monorepo invocation patterns](docs/monorepo.md)
 - [Performance tuning](docs/performance-tuning.md)
 - [Report consumer guide](docs/report-consumer.md)
 - [Roadmap](docs/roadmap.md)

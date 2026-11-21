@@ -21,9 +21,9 @@ array.
 | Report | Fields |
 | --- | --- |
 | List | `schema_version`, `mutants` |
-| List selection metadata | `metadata` includes `file_filter`, `shard_index`, and `shard_total` when `--file` or `--shard` is active |
+| List selection metadata | `metadata` includes active `operator_filter`, `file_filter`, `function_filter`, `shard_index`, and `shard_total` values when any corresponding selector is used |
 | Test | `schema_version`, `results`; each result has `mutant` and `outcome` |
-| Test run metadata | `metadata` contains nullable `rustc_version` and `cargo_version`, the configured `test_command`, effective `compile_timeout_seconds` and `test_timeout_seconds`, and the active `file_filter`, `shard_index`, and `shard_total` (null when not selected) |
+| Test run metadata | `metadata` contains nullable `rustc_version` and `cargo_version`, the configured `test_command`, effective `compile_timeout_seconds` and `test_timeout_seconds`, plus `operator_filter`, `file_filter`, `function_filter`, `shard_index`, and `shard_total` (null when not selected) |
 | Suppression summary | Optional `suppression` with `count` and `details` when suppressions were recorded |
 
 Each mutant includes `id`, `operator`, `file`, nullable `function`, `span`
@@ -35,8 +35,8 @@ at 1. Markdown source links assume the project root as their base.
 
 Mutant IDs are deterministic for identical source and discovery settings. IDs
 survive sharding, but can shift when the source or discovery filters change.
-JSON list and test reports record active `--file` and `--shard INDEX/TOTAL`
-selection, including the one-based shard index and total. Store the revision
+JSON list and test reports record active `--operator`, `--file`, `--function`,
+and `--shard INDEX/TOTAL` selection, including the one-based shard index and total. Store the revision
 and other discovery settings alongside reports when comparing runs.
 
 ## Reproduce the CLI score

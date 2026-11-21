@@ -73,6 +73,7 @@ Do not publish a claim that a third-party project is exploitable based only on a
 - Treat compile-invalid mutants as `UNVIABLE`, not `KILLED`.
 - Treat timeouts separately from killed/survived mutants.
 - Correct classification is more important than build-cache speed.
+- Write stderr diagnostics through `src/diagnostics.rs` so they carry the lowercase `error: `, `warning: `, or `note: ` prefix. Start messages with a lowercase letter (flags, identifiers, and paths excepted) and omit the trailing period. `tests/diagnostic_prefixes_cli.rs` enforces this for `bail!`, `.context(...)`, and the diagnostic helpers. See [message format](docs/troubleshooting.md#message-format).
 
 ## Pull request scope
 

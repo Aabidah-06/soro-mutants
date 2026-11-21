@@ -508,19 +508,32 @@ struct RunMetadata {
 
 #[derive(Clone, Debug, Serialize)]
 struct SelectionMetadata {
+    operator_filter: Option<String>,
     file_filter: Option<String>,
+    function_filter: Option<String>,
     shard_index: Option<usize>,
     shard_total: Option<usize>,
 }
 
 impl SelectionMetadata {
-    fn capture(file_filter: Option<&str>, shard: Option<Shard>) -> Option<Self> {
-        if file_filter.is_none() && shard.is_none() {
+    fn capture(
+        operator_filter: Option<&str>,
+        file_filter: Option<&str>,
+        function_filter: Option<&str>,
+        shard: Option<Shard>,
+    ) -> Option<Self> {
+        if operator_filter.is_none()
+            && file_filter.is_none()
+            && function_filter.is_none()
+            && shard.is_none()
+        {
             return None;
         }
 
         Some(Self {
+            operator_filter: operator_filter.map(str::to_owned),
             file_filter: file_filter.map(str::to_owned),
+            function_filter: function_filter.map(str::to_owned),
             shard_index: shard.map(|value| value.index),
             shard_total: shard.map(|value| value.total),
         })
@@ -531,7 +544,9 @@ impl RunMetadata {
     fn capture(
         test_command: &str,
         timeouts: Timeouts,
+        operator_filter: Option<&str>,
         file_filter: Option<&str>,
+        function_filter: Option<&str>,
         shard: Option<Shard>,
     ) -> Self {
         Self {
@@ -541,7 +556,9 @@ impl RunMetadata {
             compile_timeout_seconds: timeouts.compile,
             test_timeout_seconds: timeouts.test,
             selection: SelectionMetadata {
+                operator_filter: operator_filter.map(str::to_owned),
                 file_filter: file_filter.map(str::to_owned),
+                function_filter: function_filter.map(str::to_owned),
                 shard_index: shard.map(|value| value.index),
                 shard_total: shard.map(|value| value.total),
             },
@@ -2419,7 +2436,15 @@ fn run() -> Result<()> {
                             count: suppressed.len(),
                             details: &suppressed,
                         }),
-                        ..list_report(&mutants, SelectionMetadata::capture(file.as_deref(), shard),)
+                        ..list_report(
+                            &mutants,
+                            SelectionMetadata::capture(
+                                operator.as_deref(),
+                                file.as_deref(),
+                                function.as_deref(),
+                                shard,
+                            ),
+                        )
                     })?
                 )?;
             } else {
@@ -2483,7 +2508,14 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            let metadata = RunMetadata::capture(&test_command, timeouts, file.as_deref(), shard);
+            let metadata = RunMetadata::capture(
+                &test_command,
+                timeouts,
+                operator.as_deref(),
+                file.as_deref(),
+                function.as_deref(),
+                shard,
+            );
             let root = path
                 .canonicalize()
                 .with_context(|| format!("cannot resolve {}", path.display()))?;

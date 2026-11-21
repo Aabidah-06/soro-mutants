@@ -40,7 +40,9 @@ fn empty_list_and_test_json_use_versioned_envelopes() {
         assert!(output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         if command == "list" {
-            assert_eq!(report.as_object().unwrap().len(), 2);
+            assert_eq!(report.as_object().unwrap().len(), 3);
+            assert_eq!(report["metadata"]["operator_filter"], "TOKEN-001");
+            assert!(report["metadata"]["function_filter"].is_null());
         } else {
             for field in [
                 "schema_version",
@@ -90,6 +92,8 @@ fn test_json_records_execution_context_without_host_inventory() {
     assert_eq!(metadata["test_command"], "true");
     assert_eq!(metadata["compile_timeout_seconds"], 15);
     assert_eq!(metadata["test_timeout_seconds"], 20);
+    assert!(metadata["operator_filter"].is_null());
+    assert!(metadata["function_filter"].is_null());
     assert!(metadata["rustc_version"].is_string() || metadata["rustc_version"].is_null());
     assert!(metadata["cargo_version"].is_string() || metadata["cargo_version"].is_null());
     assert!(metadata.get("environment").is_none());
@@ -111,7 +115,9 @@ fn list_and_test_json_record_file_and_shard_selection() {
     assert_eq!(
         list_report["metadata"],
         serde_json::json!({
+            "operator_filter": null,
             "file_filter": "src/not-selected.rs",
+            "function_filter": null,
             "shard_index": 2,
             "shard_total": 3
         })
@@ -138,4 +144,50 @@ fn list_and_test_json_record_file_and_shard_selection() {
     assert_eq!(test_report["metadata"]["shard_index"], 2);
     assert_eq!(test_report["metadata"]["shard_total"], 3);
     assert_eq!(test_report["results"], serde_json::json!([]));
+}
+
+#[test]
+fn test_json_records_active_operator_and_function_filters() {
+    let output = run(
+        "test",
+        &[
+            "--json",
+            "--test-command",
+            "true",
+            "--operator",
+            "AUTH-001",
+            "--function",
+            "change_admin",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["metadata"]["operator_filter"], "AUTH-001");
+    assert_eq!(report["metadata"]["function_filter"], "change_admin");
+}
+
+#[test]
+fn list_json_records_active_operator_and_function_filters() {
+    let output = run(
+        "list",
+        &[
+            "--json",
+            "--operator",
+            "AUTH-001",
+            "--function",
+            "change_admin",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["metadata"]["operator_filter"], "AUTH-001");
+    assert_eq!(report["metadata"]["function_filter"], "change_admin");
 }
