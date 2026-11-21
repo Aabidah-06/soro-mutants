@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{fs, process::Command, time::{SystemTime, UNIX_EPOCH}};
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_cargo-soro-mutants"))
@@ -55,24 +55,30 @@ fn benchmark_negative_timeout_is_a_usage_error() {
 
 #[test]
 fn non_negative_timeout_values_are_accepted() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "soro-timeout-parser-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
+    let root = root.to_string_lossy().into_owned();
+
     for (flag, value) in [
         ("--timeout", "0"),
         ("--compile-timeout", "0"),
         ("--test-timeout", "5"),
     ] {
-        let output = run(&[
-            "test",
-            "fixtures/weak-auth",
-            "--operator",
-            "TOKEN-001",
-            flag,
-            value,
-            "--json",
-        ]);
+        let output = run(&["test", &root, flag, value, "--json"]);
         assert!(
             output.status.success(),
             "{flag}={value}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    fs::remove_dir_all(root).unwrap();
 }
