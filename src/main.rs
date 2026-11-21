@@ -1,3 +1,4 @@
+mod diagnostics;
 mod redaction;
 
 use anyhow::{bail, Context, Result};
@@ -258,6 +259,9 @@ enum Commands {
         /// Write the selected text, JSON, or Markdown report to a file.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Suppress per-mutant progress and baseline lines in text output; the final summary is still printed.
+        #[arg(long)]
+        no_progress: bool,
         /// Resume an interrupted mutation run from the local progress file.
         #[arg(long)]
         resume: bool,
@@ -377,10 +381,22 @@ struct SourceSpan {
     end_column: usize,
 }
 
+fn normalized_report_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn serialize_portable_path<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&normalized_report_path(path))
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Mutant {
     id: String,
     operator: String,
+    #[serde(serialize_with = "serialize_portable_path")]
     file: PathBuf,
     function: Option<String>,
     span: SourceSpan,
@@ -495,17 +511,6 @@ struct TestReport<'a> {
     by_function: BTreeMap<String, OutcomeCounts>,
 }
 
-#[derive(Debug, Serialize)]
-struct RunMetadata {
-    rustc_version: Option<String>,
-    cargo_version: Option<String>,
-    test_command: String,
-    compile_timeout_seconds: u64,
-    test_timeout_seconds: u64,
-    #[serde(flatten)]
-    selection: SelectionMetadata,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct SelectionMetadata {
     operator_filter: Option<String>,
@@ -529,7 +534,6 @@ impl SelectionMetadata {
         {
             return None;
         }
-
         Some(Self {
             operator_filter: operator_filter.map(str::to_owned),
             file_filter: file_filter.map(str::to_owned),
@@ -538,6 +542,20 @@ impl SelectionMetadata {
             shard_total: shard.map(|value| value.total),
         })
     }
+}
+
+#[derive(Debug, Serialize)]
+struct RunMetadata {
+    rustc_version: Option<String>,
+    cargo_version: Option<String>,
+    test_command: String,
+    compile_timeout_seconds: u64,
+    test_timeout_seconds: u64,
+    operator_filter: Option<String>,
+    file_filter: Option<String>,
+    function_filter: Option<String>,
+    shard_index: Option<usize>,
+    shard_total: Option<usize>,
 }
 
 impl RunMetadata {
@@ -555,13 +573,11 @@ impl RunMetadata {
             test_command: redact_environment_secrets(test_command),
             compile_timeout_seconds: timeouts.compile,
             test_timeout_seconds: timeouts.test,
-            selection: SelectionMetadata {
-                operator_filter: operator_filter.map(str::to_owned),
-                file_filter: file_filter.map(str::to_owned),
-                function_filter: function_filter.map(str::to_owned),
-                shard_index: shard.map(|value| value.index),
-                shard_total: shard.map(|value| value.total),
-            },
+            operator_filter: operator_filter.map(str::to_owned),
+            file_filter: file_filter.map(str::to_owned),
+            function_filter: function_filter.map(str::to_owned),
+            shard_index: shard.map(|value| value.index),
+            shard_total: shard.map(|value| value.total),
         }
     }
 }
@@ -930,27 +946,27 @@ fn load_result_cache(path: &Path, expected: &ResultCacheIdentity) -> Result<Pers
     let cache: PersistentResultCache = match serde_json::from_str(&content) {
         Ok(cache) => cache,
         Err(_) => {
-            eprintln!(
+            diagnostics::warning(&format!(
                 "result cache miss: ignoring malformed cache at {}",
                 path.display()
-            );
+            ));
             return Ok(PersistentResultCache::empty(expected.clone()));
         }
     };
     if cache.version != RESULT_CACHE_VERSION {
-        eprintln!(
+        diagnostics::warning(&format!(
             "result cache miss: unsupported cache version {} at {}",
             cache.version,
             path.display()
-        );
+        ));
         return Ok(PersistentResultCache::empty(expected.clone()));
     }
     if cache.identity != *expected {
-        eprintln!("result cache miss: cache identity does not match the current run");
+        diagnostics::warning("result cache miss: cache identity does not match the current run");
         return Ok(PersistentResultCache::empty(expected.clone()));
     }
     if cache.entries_hash != PersistentResultCache::hash_entries(&cache.entries) {
-        eprintln!("result cache miss: stored outcomes failed their integrity check");
+        diagnostics::warning("result cache miss: stored outcomes failed their integrity check");
         return Ok(PersistentResultCache::empty(expected.clone()));
     }
     Ok(cache)
@@ -2360,14 +2376,91 @@ fn ensure_min_score(results: &[MutantResult], minimum: Option<f64>) -> Result<()
     Ok(())
 }
 
+/// The active selection options, rendered for empty-selection diagnostics.
+struct SelectionFilters<'a> {
+    package: &'a [String],
+    operator: Option<&'a str>,
+    exclude_globs: Vec<String>,
+    shard: Option<Shard>,
+    file: Option<&'a str>,
+    function: Option<&'a str>,
+    changed_file: &'a [PathBuf],
+    diff_base: Option<&'a str>,
+    changed_functions: bool,
+}
+
+impl SelectionFilters<'_> {
+    fn discovery_filters(&self) -> Vec<String> {
+        let mut filters = Vec::new();
+        filters.extend(self.package.iter().map(|name| format!("--package {name}")));
+        if let Some(operator) = self.operator {
+            filters.push(format!("--operator {operator}"));
+        }
+        if let Some(file) = self.file {
+            filters.push(format!("--file {file}"));
+        }
+        if let Some(function) = self.function {
+            filters.push(format!("--function {function}"));
+        }
+        filters.extend(
+            self.exclude_globs
+                .iter()
+                .map(|glob| format!("--exclude-path {glob}")),
+        );
+        filters
+    }
+
+    fn changed_filters(&self) -> Vec<String> {
+        let mut filters = Vec::new();
+        filters.extend(
+            self.changed_file
+                .iter()
+                .map(|path| format!("--changed-file {}", path.display())),
+        );
+        if let Some(base) = self.diff_base {
+            filters.push(format!("--diff-base {base}"));
+        }
+        if self.changed_functions {
+            filters.push("--changed-functions".to_owned());
+        }
+        filters
+    }
+
+    fn empty_selection(
+        &self,
+        root: &Path,
+        stats: DiscoveryStats,
+        after_discovery: usize,
+        after_changed: usize,
+    ) -> diagnostics::EmptySelection {
+        let discovery_filters = self.discovery_filters();
+        let changed_filters = self.changed_filters();
+        let shard = self
+            .shard
+            .map(|value| format!("--shard {}/{}", value.index, value.total));
+        let mut filters = discovery_filters.clone();
+        filters.extend(changed_filters.iter().cloned());
+        filters.extend(shard.iter().cloned());
+        diagnostics::EmptySelection {
+            root: root.to_path_buf(),
+            filters,
+            discovery_filters,
+            changed_filters,
+            shard,
+            files_scanned: stats.files_scanned,
+            unparsable_files: stats.unparsable_files,
+            candidates: stats.candidates,
+            after_discovery,
+            after_changed,
+        }
+    }
+}
+
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!(
-                "Error: {}",
-                redact_environment_secrets(&format!("{error:#}"))
-            );
+            diagnostics::fatal(&error);
             if error.downcast_ref::<BaselineFailure>().is_some() {
                 std::process::ExitCode::from(3)
             } else if error.downcast_ref::<ScoreThresholdFailure>().is_some() {
@@ -2408,7 +2501,25 @@ fn run() -> Result<()> {
                 .canonicalize()
                 .with_context(|| format!("cannot resolve {}", path.display()))?;
             let package_dirs = resolve_package_filter(&root, &package)?;
-            let (mutants, suppressed) = discover_mutants_with_suppressions(
+            let selection_filters = SelectionFilters {
+                package: &package,
+                operator: operator.as_deref(),
+                exclude_globs: exclude_path
+                    .iter()
+                    .map(|glob| glob.glob().to_string())
+                    .collect(),
+                shard,
+                file: file.as_deref(),
+                function: function.as_deref(),
+                changed_file: &changed_file,
+                diff_base: diff_base.as_deref(),
+                changed_functions,
+            };
+            let Discovery {
+                mutants,
+                suppressed,
+                stats,
+            } = discover_mutants_detailed(
                 &root,
                 package_dirs.as_deref(),
                 operator.as_deref(),
@@ -2416,6 +2527,7 @@ fn run() -> Result<()> {
                 function.as_deref(),
                 &exclusion_set(exclude_path)?,
             )?;
+            let after_discovery = mutants.len();
             let mutants = filter_changed_mutants(
                 &root,
                 mutants,
@@ -2423,7 +2535,16 @@ fn run() -> Result<()> {
                 diff_base.as_deref(),
                 changed_functions,
             )?;
+            let after_changed = mutants.len();
             let mutants = select_shard(mutants, shard);
+            if mutants.is_empty() {
+                diagnostics::report_empty_selection(&selection_filters.empty_selection(
+                    &root,
+                    stats,
+                    after_discovery,
+                    after_changed,
+                ));
+            }
             let mut report = report_writer(output.as_deref())?;
             if count_only {
                 writeln!(report, "{}", mutants.len())?;
@@ -2479,6 +2600,7 @@ fn run() -> Result<()> {
             github_summary,
             min_score,
             output,
+            no_progress,
             resume,
             progress_file,
             cache,
@@ -2524,7 +2646,22 @@ fn run() -> Result<()> {
                 .iter()
                 .map(|glob| glob.glob().to_string())
                 .collect::<Vec<_>>();
-            let (mutants, suppressed) = discover_mutants_with_suppressions(
+            let selection_filters = SelectionFilters {
+                package: &package,
+                operator: operator.as_deref(),
+                exclude_globs: exclude_globs.clone(),
+                shard,
+                file: file.as_deref(),
+                function: function.as_deref(),
+                changed_file: &changed_file,
+                diff_base: diff_base.as_deref(),
+                changed_functions,
+            };
+            let Discovery {
+                mutants,
+                suppressed,
+                stats,
+            } = discover_mutants_detailed(
                 &root,
                 package_dirs.as_deref(),
                 operator.as_deref(),
@@ -2532,6 +2669,7 @@ fn run() -> Result<()> {
                 function.as_deref(),
                 &exclusion_set(exclude_path)?,
             )?;
+            let after_discovery = mutants.len();
             let mutants = filter_changed_mutants(
                 &root,
                 mutants,
@@ -2539,7 +2677,16 @@ fn run() -> Result<()> {
                 diff_base.as_deref(),
                 changed_functions,
             )?;
+            let after_changed = mutants.len();
             let mutants = select_shard(mutants, shard);
+            if mutants.is_empty() {
+                diagnostics::report_empty_selection(&selection_filters.empty_selection(
+                    &root,
+                    stats,
+                    after_discovery,
+                    after_changed,
+                ));
+            }
             if !mutants.is_empty() && runner == Runner::Nextest {
                 ensure_nextest_available()?;
             }
@@ -2648,21 +2795,21 @@ fn run() -> Result<()> {
                 fs::remove_file(&cache_file).with_context(|| {
                     format!("cannot clear result cache at {}", cache_file.display())
                 })?;
-                eprintln!(
+                diagnostics::note(&format!(
                     "cleared persistent result cache at {}",
                     cache_file.display()
-                );
+                ));
             }
             let cache_enabled = cache && !no_cache;
             let mut result_cache = if cache_enabled {
-                eprintln!(
+                diagnostics::note(&format!(
                     "persistent result cache enabled at {}",
                     cache_file.display()
-                );
+                ));
                 load_result_cache(&cache_file, &result_identity)?
             } else {
                 if no_cache {
-                    eprintln!("persistent result cache disabled");
+                    diagnostics::note("persistent result cache disabled");
                 }
                 PersistentResultCache::empty(result_identity.clone())
             };
@@ -2673,7 +2820,8 @@ fn run() -> Result<()> {
                 .as_deref()
                 .map(|dir| root.join(dir))
                 .unwrap_or_else(|| root.clone());
-            if !json && !markdown && !html && !sarif {
+            let text_progress = !json && !markdown && !html && !sarif && !no_progress;
+            if text_progress {
                 writeln!(
                     report,
                     "Baseline: {}",
@@ -2687,7 +2835,7 @@ fn run() -> Result<()> {
                 &baseline_target_dir,
             )? {
                 ProcessResult::Passed => {
-                    if !json && !markdown && !html && !sarif {
+                    if text_progress {
                         writeln!(report, "Baseline PASS\n")?;
                     }
                 }
@@ -2702,7 +2850,6 @@ fn run() -> Result<()> {
                 }
             }
 
-            let text_progress = !json && !markdown && !html && !sarif;
             let mut outcome_slots: Vec<Option<Outcome>> = vec![None; mutants.len()];
             let mut pending_mutants = Vec::new();
             let mut pending_indices = Vec::new();
@@ -2807,10 +2954,10 @@ fn run() -> Result<()> {
             if cache_enabled {
                 result_cache.identity = result_identity;
                 save_result_cache(&cache_file, &mut result_cache)?;
-                eprintln!(
+                diagnostics::note(&format!(
                     "result cache: {cache_hits} hit(s), {cache_misses} miss(es), {} stored",
                     result_cache.entries.len()
-                );
+                ));
             }
 
             if json {
@@ -2911,7 +3058,9 @@ fn run() -> Result<()> {
                 print_platform_report(&mut io::stdout(), &report)?;
             }
             if report.status == "unsupported" {
-                bail!("{}", report.summary);
+                bail!(
+                    "unsupported platform; run `check-platform --json` for per-check remediation"
+                );
             }
         }
         Commands::Operators => {
@@ -3735,10 +3884,10 @@ fn run_benchmark_matrix(
         targets: summaries,
     };
     if !failures.is_empty() {
-        eprintln!(
+        diagnostics::warning(&format!(
             "benchmark baseline/execution failures: {}",
             failures.join("; ")
-        );
+        ));
     }
     Ok(summary)
 }
@@ -4176,7 +4325,7 @@ fn filter_changed_mutants(
             .output()
             .context("cannot locate Git repository")?;
         if !output.status.success() {
-            bail!("Git repository metadata is unavailable for --diff-base");
+            bail!("cannot read Git repository metadata for --diff-base");
         }
         let top = PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?;
         let diff = Command::new("git")
@@ -4549,6 +4698,43 @@ fn discover_mutants_with_suppressions(
     function_filter: Option<&str>,
     exclusions: &GlobSet,
 ) -> Result<(Vec<Mutant>, Vec<SuppressedMutant>)> {
+    let discovery = discover_mutants_detailed(
+        root,
+        package_dirs,
+        operator,
+        file_filter,
+        function_filter,
+        exclusions,
+    )?;
+    Ok((discovery.mutants, discovery.suppressed))
+}
+
+/// Discovery output plus the facts needed to explain an empty selection.
+struct Discovery {
+    mutants: Vec<Mutant>,
+    suppressed: Vec<SuppressedMutant>,
+    stats: DiscoveryStats,
+}
+
+#[derive(Default)]
+struct DiscoveryStats {
+    /// Rust source files that were read and parsed successfully.
+    files_scanned: usize,
+    /// Project-relative Rust source files skipped because they failed to parse.
+    unparsable_files: Vec<PathBuf>,
+    /// Mutants found before operator/file/function filters and suppression.
+    candidates: usize,
+}
+
+fn discover_mutants_detailed(
+    root: &Path,
+    package_dirs: Option<&[PathBuf]>,
+    operator: Option<&str>,
+    file_filter: Option<&str>,
+    function_filter: Option<&str>,
+    exclusions: &GlobSet,
+) -> Result<Discovery> {
+    let mut stats = DiscoveryStats::default();
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot resolve {}", root.display()))?;
@@ -4587,21 +4773,26 @@ fn discover_mutants_with_suppressions(
 
         let source = read_rust_source(entry.path())?;
         validate_source_nesting(&source, entry.path())?;
-        let syntax = match syn::parse_file(&source) {
-            Ok(file) => file,
-            Err(_) => continue,
-        };
         let relative = entry
             .path()
             .strip_prefix(&root)
             .unwrap_or(entry.path())
             .to_path_buf();
+        let syntax = match syn::parse_file(&source) {
+            Ok(file) => file,
+            Err(_) => {
+                stats.unparsable_files.push(relative);
+                continue;
+            }
+        };
+        stats.files_scanned += 1;
 
         let mut visitor = SemanticVisitor::new(&source, relative);
         visitor.visit_file(&syntax);
         mutants.extend(visitor.mutants);
     }
 
+    stats.candidates = mutants.len();
     if let Some(operator) = operator {
         mutants.retain(|m| m.operator == operator);
     }
@@ -4642,7 +4833,12 @@ fn discover_mutants_with_suppressions(
         mutant.id = format!("M{:04}", index + 1);
     }
 
-    Ok((mutants, suppressed))
+    stats.unparsable_files.sort();
+    Ok(Discovery {
+        mutants,
+        suppressed,
+        stats,
+    })
 }
 
 /// Names bound anywhere in a function body (let, closure, match and loop
@@ -6055,14 +6251,9 @@ fn print_markdown_report(report: &mut dyn Write, results: &[MutantResult]) -> Re
             .filter(|r| outcome_label(&r.outcome) == label)
         {
             let mutant = &result.mutant;
-            let path = mutant.file.to_string_lossy().replace('\\', "/");
-            let target = path
-                .replace('%', "%25")
-                .replace(' ', "%20")
-                .replace('(', "%28")
-                .replace(')', "%29")
-                .replace('#', "%23");
-            let link_label = path.replace('[', "\\[").replace(']', "\\]");
+            let path = normalized_report_path(&mutant.file);
+            let target = encode_markdown_link_path(&path);
+            let link_label = escape_markdown_link_label(&path);
             let description = mutant
                 .description
                 .replace(['\n', '\r'], " ")
@@ -6082,6 +6273,32 @@ fn print_markdown_report(report: &mut dyn Write, results: &[MutantResult]) -> Re
         writeln!(report)?;
     }
     Ok(())
+}
+
+fn encode_markdown_link_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn escape_markdown_link_label(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, '\\' | '`' | '*' | '_' | '[' | ']' | '!') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn escape_github_annotation_property(value: &str) -> String {
@@ -6232,6 +6449,90 @@ fn outcome_label(outcome: &Outcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_report_paths_use_forward_slashes() {
+        #[derive(Serialize)]
+        struct PathReport {
+            #[serde(serialize_with = "serialize_portable_path")]
+            file: PathBuf,
+        }
+
+        let report = PathReport {
+            file: PathBuf::from(r"src\space dir\lib.rs"),
+        };
+        assert_eq!(
+            serde_json::to_string(&report).unwrap(),
+            r#"{"file":"src/space dir/lib.rs"}"#
+        );
+    }
+
+    #[test]
+    fn markdown_link_paths_encode_special_characters() {
+        assert_eq!(
+            encode_markdown_link_path("src/space dir/a#b%[c](d)?e&é.rs"),
+            "src/space%20dir/a%23b%25%5Bc%5D%28d%29%3Fe%26%C3%A9.rs"
+        );
+        assert_eq!(
+            escape_markdown_link_label("src/[x]_y.rs"),
+            "src/\\[x\\]\\_y.rs"
+        );
+    }
+
+    #[test]
+    fn property_source_replacements_preserve_bytes_outside_selected_range() {
+        const CHARS: &[char] = &['a', 'Z', '0', ' ', '\n', 'é', 'λ', '🦀'];
+        let mut state = 0x7f4a_7c15_d1ce_4e5b_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) as usize
+        };
+
+        for case in 0..256 {
+            let source_len = 2 + next() % 39;
+            let source: String = (0..source_len)
+                .map(|_| CHARS[next() % CHARS.len()])
+                .collect();
+            let boundaries: Vec<usize> = source
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(source.len()))
+                .collect();
+            let start_index = next() % (boundaries.len() - 1);
+            let end_index = start_index + 1 + next() % (boundaries.len() - start_index - 1);
+            let start_byte = boundaries[start_index];
+            let end_byte = boundaries[end_index];
+            let replacement: String = (0..next() % 9)
+                .map(|_| CHARS[next() % CHARS.len()])
+                .collect();
+            let mutated = replace_source_range(
+                &source,
+                start_byte,
+                end_byte,
+                &source[start_byte..end_byte],
+                &replacement,
+            )
+            .expect("generated valid source ranges should be replaceable");
+
+            assert_eq!(
+                &mutated.as_bytes()[..start_byte],
+                &source.as_bytes()[..start_byte],
+                "prefix changed outside case {case}"
+            );
+            assert_eq!(
+                &mutated.as_bytes()[start_byte + replacement.len()..],
+                &source.as_bytes()[end_byte..],
+                "suffix changed outside case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_replacement_rejects_invalid_utf8_boundaries_and_stale_text() {
+        assert!(replace_source_range("aλb", 2, 3, "λ", "x").is_err());
+        assert!(replace_source_range("abc", 1, 4, "bc", "x").is_err());
+        assert!(replace_source_range("abc", 1, 2, "x", "y").is_err());
+    }
 
     #[test]
     fn equivalent_suppression_recognizes_no_change_and_repeated_edit() {
@@ -6423,61 +6724,6 @@ mod tests {
             output.contains(&count_line),
             "output should contain operator count; got:\n{output}"
         );
-    }
-
-    #[test]
-    fn property_source_replacements_preserve_bytes_outside_selected_range() {
-        const CHARS: &[char] = &['a', 'Z', '0', ' ', '\n', 'é', 'λ', '🦀'];
-        let mut state = 0x7f4a_7c15_d1ce_4e5b_u64;
-        let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (state >> 32) as usize
-        };
-
-        for case in 0..256 {
-            let source_len = 2 + next() % 39;
-            let source: String = (0..source_len)
-                .map(|_| CHARS[next() % CHARS.len()])
-                .collect();
-            let boundaries: Vec<usize> = source
-                .char_indices()
-                .map(|(index, _)| index)
-                .chain(std::iter::once(source.len()))
-                .collect();
-            let start_index = next() % (boundaries.len() - 1);
-            let end_index = start_index + 1 + next() % (boundaries.len() - start_index - 1);
-            let start_byte = boundaries[start_index];
-            let end_byte = boundaries[end_index];
-            let replacement: String = (0..next() % 9)
-                .map(|_| CHARS[next() % CHARS.len()])
-                .collect();
-            let mutated = replace_source_range(
-                &source,
-                start_byte,
-                end_byte,
-                &source[start_byte..end_byte],
-                &replacement,
-            )
-            .expect("generated valid source ranges should be replaceable");
-
-            assert_eq!(
-                &mutated.as_bytes()[..start_byte],
-                &source.as_bytes()[..start_byte],
-                "prefix changed outside case {case}"
-            );
-            assert_eq!(
-                &mutated.as_bytes()[start_byte + replacement.len()..],
-                &source.as_bytes()[end_byte..],
-                "suffix changed outside case {case}"
-            );
-        }
-    }
-
-    #[test]
-    fn source_replacement_rejects_invalid_utf8_boundaries_and_stale_text() {
-        assert!(replace_source_range("aλb", 2, 3, "λ", "x").is_err());
-        assert!(replace_source_range("abc", 1, 4, "bc", "x").is_err());
-        assert!(replace_source_range("abc", 1, 2, "x", "y").is_err());
     }
 
     fn report_mutant() -> Mutant {
