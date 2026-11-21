@@ -234,13 +234,13 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Runner::CargoTest)]
         runner: Runner,
         /// Legacy timeout in seconds used for both phases unless overridden.
-        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds)]
+        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
         timeout: u64,
         /// Timeout in seconds for each mutant's separate compile gate.
-        #[arg(long, value_parser = parse_timeout_seconds)]
+        #[arg(long, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
         compile_timeout: Option<u64>,
         /// Timeout in seconds for baseline and mutant test commands.
-        #[arg(long, value_parser = parse_timeout_seconds)]
+        #[arg(long, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
         test_timeout: Option<u64>,
         /// Number of mutants to execute concurrently (1 keeps serial execution).
         /// Each worker uses its own scratch worktree and Cargo target directory.
@@ -321,7 +321,7 @@ enum Commands {
         #[arg(long, default_value = ".soro-mutants-benchmarks")]
         checkout_dir: PathBuf,
         /// Timeout in seconds for each target's baseline and mutant commands.
-        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds)]
+        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
         timeout: u64,
         /// Only run the target with this manifest id.
         #[arg(long, value_name = "ID")]
