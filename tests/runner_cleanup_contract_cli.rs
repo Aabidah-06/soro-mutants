@@ -95,6 +95,80 @@ fn baseline_failure_removes_scratch_and_preserves_source() {
     verify_cleanup(fixture.path());
 }
 
+#[test]
+fn compile_failure_removes_scratch_and_preserves_source() {
+    let fixture = Fixture::new();
+    let manifest = r#"[package]
+name = "compile-cleanup-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"#;
+    let source = r#"pub struct Address;
+
+impl Address {
+    pub fn require_auth(&self) -> i32 {
+        1
+    }
+}
+
+pub fn check(user: Address) -> i32 {
+    user.require_auth()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_is_valid() {
+        assert_eq!(check(Address), 1);
+    }
+}
+"#;
+    fs::write(fixture.path().join("Cargo.toml"), manifest).unwrap();
+    fs::write(fixture.path().join("src/lib.rs"), source).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-soro-mutants"))
+        .arg("test")
+        .arg(fixture.path())
+        .args([
+            "--operator",
+            "AUTH-001",
+            "--test-command",
+            "cargo test -q",
+            "--compile-timeout",
+            "30",
+            "--test-timeout",
+            "30",
+            "--json",
+        ])
+        .output()
+        .expect("compile-failure cleanup run should launch");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["results"].as_array().unwrap().len(), 1);
+    assert_eq!(report["results"][0]["outcome"], "UNVIABLE");
+    assert!(
+        !fixture.path().join(".soro-mutants-worktree").exists(),
+        "compile failure must remove scratch worktree"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path().join("source-sentinel")).unwrap(),
+        "unchanged"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path().join("src/lib.rs")).unwrap(),
+        source
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn baseline_timeout_removes_scratch_and_preserves_source() {
