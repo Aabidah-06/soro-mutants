@@ -1,4 +1,7 @@
-use std::{process::Command, sync::{Mutex, OnceLock}};
+use std::{
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 
 fn fixture_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
