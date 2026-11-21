@@ -381,8 +381,7 @@ fn completion_script(shell: CompletionShell) -> Vec<u8> {
     );
 
     if matches!(shell, CompletionShell::Bash) {
-        let script = String::from_utf8(output)
-            .expect("clap-generated Bash completion scripts must be UTF-8");
+        let script = String::from_utf8_lossy(&output);
         return script
             .replace(
                 r#"COMPREPLY=($(compgen -f "${cur}"))"#,
