@@ -32,6 +32,18 @@ fn rejects_unsupported_completion_shell() {
 }
 
 #[test]
+fn operator_completion_lists_operator_ids() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-soro-mutants"))
+        .args(["completions", "bash"])
+        .output()
+        .expect("CLI should launch");
+    assert!(output.status.success());
+    let script = String::from_utf8_lossy(&output.stdout);
+    assert!(script.contains("AUTH-001"));
+    assert!(script.contains("TTL-003"));
+}
+
+#[test]
 fn bash_path_completion_does_not_split_paths_with_spaces() {
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-soro-mutants"))
         .args(["completions", "bash"])

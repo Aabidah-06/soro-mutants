@@ -29,7 +29,7 @@ fn negative_timeout_flags_are_usage_errors() {
         assert_eq!(output.status.code(), Some(2), "{flag}");
         assert!(output.stdout.is_empty(), "{flag} must not print a report");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("non-negative"), "{flag}: {stderr}");
+        assert!(stderr.contains("positive"), "{flag}: {stderr}");
         assert!(stderr.contains(flag), "{flag}: {stderr}");
     }
 }
@@ -44,7 +44,7 @@ fn malformed_timeout_is_a_usage_error() {
     ]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("non-negative integer"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("optional s, m, h, or d suffix"));
 }
 
 #[test]
@@ -53,12 +53,12 @@ fn benchmark_negative_timeout_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("non-negative"), "{stderr}");
+    assert!(stderr.contains("positive"), "{stderr}");
     assert!(stderr.contains("--timeout"), "{stderr}");
 }
 
 #[test]
-fn non_negative_timeout_values_are_accepted() {
+fn positive_timeout_values_and_suffixes_are_accepted() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -69,14 +69,14 @@ fn non_negative_timeout_values_are_accepted() {
     ));
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
-    let root = root.to_string_lossy().into_owned();
+    let root_string = root.to_string_lossy().into_owned();
 
     for (flag, value) in [
-        ("--timeout", "0"),
-        ("--compile-timeout", "0"),
-        ("--test-timeout", "5"),
+        ("--timeout", "1"),
+        ("--compile-timeout", "30s"),
+        ("--test-timeout", "2m"),
     ] {
-        let output = run(&["test", &root, flag, value, "--json"]);
+        let output = run(&["test", &root_string, flag, value, "--json"]);
         assert!(
             output.status.success(),
             "{flag}={value}: {}",
@@ -85,4 +85,15 @@ fn non_negative_timeout_values_are_accepted() {
     }
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn zero_timeout_values_are_usage_errors() {
+    for flag in ["--timeout", "--compile-timeout", "--test-timeout"] {
+        let output = run(&["test", "fixtures/weak-auth", flag, "0"]);
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(output.stdout.is_empty(), "{flag} must not print a report");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("greater than zero"), "{flag}: {stderr}");
+    }
 }

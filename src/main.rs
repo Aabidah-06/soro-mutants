@@ -27,20 +27,7 @@ use wait_timeout::ChildExt;
 use walkdir::{DirEntry, WalkDir};
 
 mod filters;
-use filters::{
-    parse_exclude_glob, parse_file_filter, parse_function_filter, parse_operator, Shard,
-};
-
-/// Parse CLI timeout seconds with an actionable error for negative values.
-fn parse_timeout_seconds(raw: &str) -> std::result::Result<u64, String> {
-    if raw.starts_with('-') {
-        return Err(format!(
-            "timeout must be a non-negative number of seconds, got {raw}"
-        ));
-    }
-    raw.parse::<u64>()
-        .map_err(|_| format!("timeout must be a non-negative integer number of seconds, got {raw}"))
-}
+use filters::{parse_exclude_glob, parse_file_filter, parse_function_filter, Shard};
 
 #[derive(Parser, Debug)]
 #[command(name = "cargo-soro-mutants")]
@@ -156,7 +143,11 @@ enum Commands {
         #[arg(short = 'p', long = "package", value_name = "SPEC")]
         package: Vec<String>,
         /// Only list mutants produced by this operator ID, such as AUTH-001.
-        #[arg(long, value_parser = parse_operator)]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new([
+            "AUTH-001", "AUTH-002", "AUTH-003", "AUTH-004", "AUTH-005", "AUTH-006", "AUTH-007",
+            "CALL-001", "CALL-002", "CALL-003", "EVENT-001", "EVENT-002", "EVENT-003", "EVENT-004", "EVENT-005",
+            "STORAGE-001", "TOKEN-001", "TOKEN-002", "TOKEN-003", "TOKEN-004", "TTL-001", "TTL-002", "TTL-003",
+        ]))]
         operator: Option<String>,
         /// Exclude a project-relative file or directory glob (repeatable).
         #[arg(long, value_name = "GLOB", value_parser = parse_exclude_glob)]
@@ -198,7 +189,11 @@ enum Commands {
         #[arg(short = 'p', long = "package", value_name = "SPEC")]
         package: Vec<String>,
         /// Only execute mutants produced by this operator ID, such as AUTH-001.
-        #[arg(long, value_parser = parse_operator)]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new([
+            "AUTH-001", "AUTH-002", "AUTH-003", "AUTH-004", "AUTH-005", "AUTH-006", "AUTH-007",
+            "CALL-001", "CALL-002", "CALL-003", "EVENT-001", "EVENT-002", "EVENT-003", "EVENT-004", "EVENT-005",
+            "STORAGE-001", "TOKEN-001", "TOKEN-002", "TOKEN-003", "TOKEN-004", "TTL-001", "TTL-002", "TTL-003",
+        ]))]
         operator: Option<String>,
         /// Exclude a project-relative file or directory glob (repeatable).
         #[arg(long, value_name = "GLOB", value_parser = parse_exclude_glob)]
@@ -234,13 +229,13 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = Runner::CargoTest)]
         runner: Runner,
         /// Legacy timeout in seconds used for both phases unless overridden.
-        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
+        #[arg(long, default_value = "120s", value_parser = parse_duration, allow_hyphen_values = true)]
         timeout: u64,
         /// Timeout in seconds for each mutant's separate compile gate.
-        #[arg(long, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
+        #[arg(long, value_parser = parse_duration, allow_hyphen_values = true)]
         compile_timeout: Option<u64>,
         /// Timeout in seconds for baseline and mutant test commands.
-        #[arg(long, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
+        #[arg(long, value_parser = parse_duration, allow_hyphen_values = true)]
         test_timeout: Option<u64>,
         /// Number of mutants to execute concurrently (1 keeps serial execution).
         /// Each worker uses its own scratch worktree and Cargo target directory.
@@ -321,7 +316,7 @@ enum Commands {
         #[arg(long, default_value = ".soro-mutants-benchmarks")]
         checkout_dir: PathBuf,
         /// Timeout in seconds for each target's baseline and mutant commands.
-        #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds, allow_hyphen_values = true)]
+        #[arg(long, default_value = "120s", value_parser = parse_duration, allow_hyphen_values = true)]
         timeout: u64,
         /// Only run the target with this manifest id.
         #[arg(long, value_name = "ID")]
@@ -2392,6 +2387,30 @@ fn parse_min_score(value: &str) -> std::result::Result<f64, String> {
         return Err("score must be a finite number from 0 to 100".to_owned());
     }
     Ok(score)
+}
+
+fn parse_duration(value: &str) -> std::result::Result<u64, String> {
+    if value.starts_with('-') {
+        return Err(format!("duration must be positive, got {value}"));
+    }
+
+    let (number, multiplier) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1_u64),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3_600),
+        Some('d') => (&value[..value.len() - 1], 86_400),
+        _ => (value, 1),
+    };
+
+    let amount = number.parse::<u64>().map_err(|_| {
+        "duration must be a positive integer with an optional s, m, h, or d suffix".to_owned()
+    })?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_owned())
 }
 
 fn ensure_min_score(results: &[MutantResult], minimum: Option<f64>) -> Result<()> {
@@ -8578,6 +8597,17 @@ mod tests {
         for invalid in ["0", "-1", "two"] {
             assert!(jobs(&["--jobs", invalid]).is_err(), "--jobs {invalid}");
         }
+    }
+
+    #[test]
+    fn duration_parser_accepts_human_suffixes_and_rejects_zero() {
+        assert_eq!(parse_duration("2s"), Ok(2));
+        assert_eq!(parse_duration("3m"), Ok(180));
+        assert_eq!(parse_duration("1h"), Ok(3_600));
+        assert_eq!(parse_duration("1d"), Ok(86_400));
+        assert_eq!(parse_duration("7"), Ok(7));
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("1w").is_err());
     }
 
     #[test]
