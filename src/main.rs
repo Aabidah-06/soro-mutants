@@ -1201,10 +1201,7 @@ fn resolve_package_filter(root: &Path, selected: &[String]) -> Result<Option<Vec
     Ok(Some(selected_dirs))
 }
 
-fn list_report(
-    mutants: &[Mutant],
-    metadata: Option<SelectionMetadata>,
-) -> ListReport<'_> {
+fn list_report(mutants: &[Mutant], metadata: Option<SelectionMetadata>) -> ListReport<'_> {
     ListReport {
         schema_version: JSON_SCHEMA_VERSION,
         mutants,
@@ -2422,10 +2419,7 @@ fn run() -> Result<()> {
                             count: suppressed.len(),
                             details: &suppressed,
                         }),
-                        ..list_report(
-                            &mutants,
-                            SelectionMetadata::capture(file.as_deref(), shard),
-                        )
+                        ..list_report(&mutants, SelectionMetadata::capture(file.as_deref(), shard),)
                     })?
                 )?;
             } else {
@@ -2489,8 +2483,7 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            let metadata =
-                RunMetadata::capture(&test_command, timeouts, file.as_deref(), shard);
+            let metadata = RunMetadata::capture(&test_command, timeouts, file.as_deref(), shard);
             let root = path
                 .canonicalize()
                 .with_context(|| format!("cannot resolve {}", path.display()))?;
