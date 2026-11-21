@@ -8,12 +8,16 @@ use std::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        static FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence =
+            FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "soro-runner-cleanup-{}-{nonce}",
+            "soro-runner-cleanup-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(root.join("src")).unwrap();
