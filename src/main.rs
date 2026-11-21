@@ -6098,10 +6098,7 @@ impl OperatorsReport {
             schema_version: 1,
             operators: BUILTIN_OPERATORS
                 .iter()
-                .map(|(id, description)| OperatorDescription {
-                    id: *id,
-                    description: *description,
-                })
+                .map(|(id, description)| OperatorDescription { id, description })
                 .collect(),
         }
     }
