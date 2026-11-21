@@ -3107,7 +3107,10 @@ fn run() -> Result<()> {
         }
         Commands::Operators { json } => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&OperatorsReport::current())?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&OperatorsReport::current())?
+                );
             } else {
                 print_operators(&mut io::stdout())?;
             }
@@ -6095,7 +6098,10 @@ impl OperatorsReport {
             schema_version: 1,
             operators: BUILTIN_OPERATORS
                 .iter()
-                .map(|(id, description)| OperatorDescription { id: *id, description: *description })
+                .map(|(id, description)| OperatorDescription {
+                    id: *id,
+                    description: *description,
+                })
                 .collect(),
         }
     }

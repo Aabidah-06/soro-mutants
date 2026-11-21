@@ -106,7 +106,10 @@ fn operators_json_is_versioned_and_stable() {
     let second = run(&["--json"]);
     assert!(first.status.success());
     assert!(second.status.success());
-    assert_eq!(first.stdout, second.stdout, "JSON catalog must be deterministic");
+    assert_eq!(
+        first.stdout, second.stdout,
+        "JSON catalog must be deterministic"
+    );
     assert!(first.stderr.is_empty());
 
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
