@@ -15,8 +15,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let sequence =
-            FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "soro-runner-cleanup-{}-{nonce}-{sequence}",
             std::process::id()
