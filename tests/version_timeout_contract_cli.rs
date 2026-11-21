@@ -37,3 +37,13 @@ fn malformed_timeout_is_a_usage_error() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("non-negative integer"));
 }
+
+#[test]
+fn benchmark_negative_timeout_is_a_usage_error() {
+    let output = run(&["benchmark-matrix", "--timeout", "-1"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("non-negative"), "{stderr}");
+    assert!(stderr.contains("--timeout"), "{stderr}");
+}
