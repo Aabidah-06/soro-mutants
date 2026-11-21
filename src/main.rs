@@ -370,6 +370,33 @@ impl From<CompletionShell> for Shell {
     }
 }
 
+fn completion_script(shell: CompletionShell) -> Vec<u8> {
+    let mut cmd = Cli::command();
+    let mut output = Vec::new();
+    generate(
+        Shell::from(shell),
+        &mut cmd,
+        "cargo-soro-mutants",
+        &mut output,
+    );
+
+    if matches!(shell, CompletionShell::Bash) {
+        let script = String::from_utf8(output)
+            .expect("clap-generated Bash completion scripts must be UTF-8");
+        return script
+            .replace(
+                r#"COMPREPLY=($(compgen -f "${cur}"))"#,
+                r#"COMPREPLY=()
+                    while IFS= read -r completion; do
+                        COMPREPLY+=("$completion")
+                    done < <(compgen -f -- "${cur}")"#,
+            )
+            .into_bytes();
+    }
+
+    output
+}
+
 fn select_shard(mutants: Vec<Mutant>, shard: Option<Shard>) -> Vec<Mutant> {
     let Some(shard) = shard else { return mutants };
     mutants
@@ -3086,13 +3113,7 @@ fn run() -> Result<()> {
             }
         }
         Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            generate(
-                Shell::from(shell),
-                &mut cmd,
-                "cargo-soro-mutants",
-                &mut io::stdout(),
-            );
+            io::stdout().write_all(&completion_script(shell))?;
         }
     }
 
