@@ -18,7 +18,7 @@ use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use syn::{
     spanned::Spanned,
@@ -224,6 +224,9 @@ enum Commands {
         /// Store Soro Mutants baseline and mutant Cargo caches under this directory.
         #[arg(long)]
         target_dir: Option<PathBuf>,
+        /// Place mutation worktrees under DIR/.soro-mutants-worktree instead of the project root.
+        #[arg(long, value_name = "DIR")]
+        scratch_dir: Option<PathBuf>,
         /// Command used for the clean baseline and each viable mutant.
         #[arg(long, default_value = "cargo test -q")]
         test_command: String,
@@ -243,6 +246,9 @@ enum Commands {
         /// Each worker uses its own scratch worktree and Cargo target directory.
         #[arg(short = 'j', long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
+        /// Record wall-clock timing for discovery, baseline, and executed mutants.
+        #[arg(long)]
+        timing: bool,
         /// Emit machine-readable JSON on stdout.
         #[arg(long)]
         json: bool,
@@ -456,10 +462,30 @@ enum Outcome {
     Timeout,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct MutantTiming {
+    total_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compile_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct RunTiming {
+    discovery_ms: u64,
+    baseline_ms: u64,
+    mutant_wall_ms: u64,
+    compile_ms: u64,
+    test_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct MutantResult {
     mutant: Mutant,
     outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timing: Option<MutantTiming>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -594,6 +620,10 @@ struct RunMetadata {
     function_filter: Option<String>,
     shard_index: Option<usize>,
     shard_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scratch_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timing: Option<RunTiming>,
 }
 
 impl RunMetadata {
@@ -616,6 +646,8 @@ impl RunMetadata {
             function_filter: function_filter.map(str::to_owned),
             shard_index: shard.map(|value| value.index),
             shard_total: shard.map(|value| value.total),
+            scratch_dir: None,
+            timing: None,
         }
     }
 }
@@ -666,6 +698,8 @@ struct ResultCacheIdentity {
     diff_base: Option<String>,
     changed_functions: bool,
     jobs: usize,
+    #[serde(default)]
+    scratch_dir: Option<String>,
     execution_env_hash: String,
     compile_timeout_seconds: u64,
     test_timeout_seconds: u64,
@@ -1325,6 +1359,16 @@ enum ProcessResult {
     Passed,
     Failed,
     Timeout,
+}
+
+#[derive(Clone, Debug)]
+struct MutantExecution {
+    outcome: Outcome,
+    timing: Option<MutantTiming>,
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2665,12 +2709,14 @@ fn run() -> Result<()> {
             changed_functions,
             test_dir,
             target_dir,
+            scratch_dir,
             test_command,
             runner,
             timeout,
             compile_timeout,
             test_timeout,
             jobs,
+            timing,
             json,
             markdown,
             html,
@@ -2697,7 +2743,7 @@ fn run() -> Result<()> {
                     test_command = format!("cargo test -q {package_words}");
                 }
             }
-            let metadata = RunMetadata::capture(
+            let mut metadata = RunMetadata::capture(
                 &test_command,
                 timeouts,
                 operator.as_deref(),
@@ -2708,6 +2754,12 @@ fn run() -> Result<()> {
             let root = path
                 .canonicalize()
                 .with_context(|| format!("cannot resolve {}", path.display()))?;
+            let scratch_root = resolve_scratch_root(&root, scratch_dir.as_deref())?;
+            if scratch_dir.is_some() {
+                metadata.scratch_dir = Some(scratch_root.display().to_string());
+            }
+
+            let discovery_started = Instant::now();
             let package_dirs = resolve_package_filter(&root, &package)?;
             let exclude_globs = exclude_path
                 .iter()
@@ -2746,6 +2798,13 @@ fn run() -> Result<()> {
             )?;
             let after_changed = mutants.len();
             let mutants = select_shard(mutants, shard);
+            let discovery_ms = duration_ms(discovery_started.elapsed());
+            if timing {
+                metadata.timing = Some(RunTiming {
+                    discovery_ms,
+                    ..RunTiming::default()
+                });
+            }
             if mutants.is_empty() {
                 diagnostics::report_empty_selection(&selection_filters.empty_selection(
                     &root,
@@ -2778,6 +2837,13 @@ fn run() -> Result<()> {
                 } else if sarif {
                     print_sarif_report(&mut report, &[])?;
                 } else {
+                    if let Some(run_timing) = metadata.timing {
+                        writeln!(
+                            report,
+                            "Timing: discovery={}ms baseline=0ms mutants=0ms compile=0ms test=0ms",
+                            run_timing.discovery_ms
+                        )?;
+                    }
                     writeln!(report, "No matching Soroban semantic mutants found.")?;
                 }
                 if !suppressed.is_empty() && !json {
@@ -2835,6 +2901,9 @@ fn run() -> Result<()> {
                 diff_base: diff_base.clone(),
                 changed_functions,
                 jobs: usize::from(jobs),
+                scratch_dir: scratch_dir
+                    .as_ref()
+                    .map(|_| scratch_root.display().to_string()),
                 execution_env_hash: execution_env_hash(),
                 compile_timeout_seconds: timeouts.compile,
                 test_timeout_seconds: timeouts.test,
@@ -2896,12 +2965,15 @@ fn run() -> Result<()> {
                     redact_environment_secrets(&test_command)
                 )?;
             }
-            match run_process(
+            let baseline_started = Instant::now();
+            let baseline_result = run_process(
                 &test_cwd,
                 &test_command,
                 timeouts.test,
                 &baseline_target_dir,
-            )? {
+            )?;
+            let baseline_ms = duration_ms(baseline_started.elapsed());
+            match baseline_result {
                 ProcessResult::Passed => {
                     if text_progress {
                         writeln!(report, "Baseline PASS\n")?;
@@ -2918,7 +2990,9 @@ fn run() -> Result<()> {
                 }
             }
 
+            let mutant_phase_started = Instant::now();
             let mut outcome_slots: Vec<Option<Outcome>> = vec![None; mutants.len()];
+            let mut timing_slots: Vec<Option<MutantTiming>> = vec![None; mutants.len()];
             let mut pending_mutants = Vec::new();
             let mut pending_indices = Vec::new();
 
@@ -2972,7 +3046,7 @@ fn run() -> Result<()> {
                 }
             }
 
-            let pending_outcomes = execute_mutants(
+            let pending_executions = execute_mutants(
                 &root,
                 &pending_mutants,
                 &ExecutionSettings {
@@ -2980,7 +3054,9 @@ fn run() -> Result<()> {
                     test_command: &test_command,
                     timeouts,
                     target_dir: target_dir.as_deref(),
+                    scratch_root: &scratch_root,
                     jobs: usize::from(jobs),
+                    timing,
                 },
                 &mut |mutant, outcome| {
                     if text_progress {
@@ -3004,20 +3080,46 @@ fn run() -> Result<()> {
                 },
             )?;
 
-            for (pending_pos, outcome) in pending_outcomes.into_iter().enumerate() {
-                outcome_slots[pending_indices[pending_pos]] = Some(outcome);
+            for (pending_pos, execution) in pending_executions.into_iter().enumerate() {
+                let index = pending_indices[pending_pos];
+                outcome_slots[index] = Some(execution.outcome);
+                timing_slots[index] = execution.timing;
             }
 
             let results = mutants
                 .into_iter()
                 .zip(outcome_slots)
-                .map(|(mutant, outcome)| {
+                .zip(timing_slots)
+                .map(|((mutant, outcome), mutant_timing)| {
                     Ok(MutantResult {
                         mutant,
                         outcome: outcome.context("mutation execution ended without an outcome")?,
+                        timing: mutant_timing,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let mutant_wall_ms = duration_ms(mutant_phase_started.elapsed());
+
+            if timing {
+                let compile_ms = results.iter().fold(0u64, |total, result| {
+                    total.saturating_add(
+                        result
+                            .timing
+                            .and_then(|value| value.compile_ms)
+                            .unwrap_or(0),
+                    )
+                });
+                let test_ms = results.iter().fold(0u64, |total, result| {
+                    total.saturating_add(result.timing.and_then(|value| value.test_ms).unwrap_or(0))
+                });
+                metadata.timing = Some(RunTiming {
+                    discovery_ms,
+                    baseline_ms,
+                    mutant_wall_ms,
+                    compile_ms,
+                    test_ms,
+                });
+            }
 
             if cache_enabled {
                 result_cache.identity = result_identity;
@@ -3047,6 +3149,17 @@ fn run() -> Result<()> {
             } else if sarif {
                 print_sarif_report(&mut report, &results)?;
             } else {
+                if let Some(run_timing) = metadata.timing {
+                    writeln!(
+                        report,
+                        "Timing: discovery={}ms baseline={}ms mutants={}ms compile={}ms test={}ms",
+                        run_timing.discovery_ms,
+                        run_timing.baseline_ms,
+                        run_timing.mutant_wall_ms,
+                        run_timing.compile_ms,
+                        run_timing.test_ms
+                    )?;
+                }
                 print_summary(&mut report, &results)?;
                 print_suppression_summary(&mut report, &suppressed)?;
             }
@@ -5518,6 +5631,36 @@ fn target_dirs(root: &Path, target_dir: Option<&Path>) -> (PathBuf, PathBuf) {
     (base.join("baseline"), base.join("mutants-shared"))
 }
 
+fn resolve_scratch_root(root: &Path, scratch_dir: Option<&Path>) -> Result<PathBuf> {
+    let Some(requested) = scratch_dir else {
+        return Ok(root.join(pathguard::SCRATCH_NAME));
+    };
+
+    let base = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("cannot resolve current directory for --scratch-dir")?
+            .join(requested)
+    };
+    fs::create_dir_all(&base)
+        .with_context(|| format!("cannot create --scratch-dir {}", base.display()))?;
+    let base = base
+        .canonicalize()
+        .with_context(|| format!("cannot resolve --scratch-dir {}", base.display()))?;
+
+    if base == root || root.starts_with(&base) {
+        bail!(
+            "--scratch-dir {} must not be the project root or one of its parents",
+            base.display()
+        );
+    }
+
+    let scratch_root = base.join(pathguard::SCRATCH_NAME);
+    pathguard::require_owned_scratch_path_under(&scratch_root, &scratch_root)?;
+    Ok(scratch_root)
+}
+
 fn reject_cleanup_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -5549,11 +5692,26 @@ fn parallel_target_root(root: &Path, target_dir: Option<&Path>) -> PathBuf {
 /// Each worker owns both paths for the whole run: no two workers ever share a
 /// source tree or a `CARGO_TARGET_DIR`, while a worker's stable paths still let
 /// Cargo reuse dependency builds between the mutants it executes.
-fn worker_paths(root: &Path, target_dir: Option<&Path>, worker: usize) -> (PathBuf, PathBuf) {
+fn worker_paths_with_scratch(
+    root: &Path,
+    target_dir: Option<&Path>,
+    scratch_root: &Path,
+    worker: usize,
+) -> (PathBuf, PathBuf) {
     let name = format!("worker-{}", worker + 1);
     (
-        root.join(".soro-mutants-worktree").join(&name),
+        scratch_root.join(&name),
         parallel_target_root(root, target_dir).join(name),
+    )
+}
+
+#[cfg(test)]
+fn worker_paths(root: &Path, target_dir: Option<&Path>, worker: usize) -> (PathBuf, PathBuf) {
+    worker_paths_with_scratch(
+        root,
+        target_dir,
+        &root.join(pathguard::SCRATCH_NAME),
+        worker,
     )
 }
 
@@ -5655,7 +5813,10 @@ struct ExecutionSettings<'a> {
     timeouts: Timeouts,
     /// The user's `--target-dir`, if any; Soro Mutants derives its caches from it.
     target_dir: Option<&'a Path>,
+    /// Resolved root directory for mutation worktrees.
+    scratch_root: &'a Path,
     jobs: usize,
+    timing: bool,
 }
 
 /// Execute every mutant and return their outcomes in input order.
@@ -5675,40 +5836,47 @@ fn execute_mutants(
     mutants: &[Mutant],
     settings: &ExecutionSettings<'_>,
     on_result: &mut dyn FnMut(&Mutant, &Outcome) -> Result<()>,
-) -> Result<Vec<Outcome>> {
+) -> Result<Vec<MutantExecution>> {
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     };
 
     let (baseline_target, serial_target) = target_dirs(root, settings.target_dir);
-    let ignored = soro_target_base(root, settings.target_dir)
+    let mut ignored = soro_target_base(root, settings.target_dir)
         .into_iter()
         .collect::<Vec<_>>();
+    if settings.scratch_root.starts_with(root) {
+        ignored.push(settings.scratch_root.to_path_buf());
+    }
     let workers = settings.jobs.max(1).min(mutants.len());
 
     if workers <= 1 {
-        let scratch = root.join(".soro-mutants-worktree");
-        let mut outcomes = Vec::with_capacity(mutants.len());
+        let scratch = settings.scratch_root.to_path_buf();
+        let mut executions = Vec::with_capacity(mutants.len());
         for mutant in mutants {
-            let outcome = execute_mutant(
+            let execution = execute_mutant(
                 root,
                 mutant,
                 settings.test_dir,
                 settings.test_command,
                 settings.timeouts,
                 &scratch,
+                settings.scratch_root,
                 &serial_target,
                 &ignored,
+                settings.timing,
             )?;
-            on_result(mutant, &outcome)?;
-            outcomes.push(outcome);
+            on_result(mutant, &execution.outcome)?;
+            executions.push(execution);
         }
-        return Ok(outcomes);
+        return Ok(executions);
     }
 
     let worker_dirs = (0..workers)
-        .map(|worker| worker_paths(root, settings.target_dir, worker))
+        .map(|worker| {
+            worker_paths_with_scratch(root, settings.target_dir, settings.scratch_root, worker)
+        })
         .collect::<Vec<_>>();
     for (_, target) in &worker_dirs {
         if target == &baseline_target || target.starts_with(&baseline_target) {
@@ -5721,11 +5889,11 @@ fn execute_mutants(
 
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
-    let mut slots: Vec<Option<Outcome>> = vec![None; mutants.len()];
+    let mut slots: Vec<Option<MutantExecution>> = vec![None; mutants.len()];
     let mut errors: Vec<(usize, anyhow::Error)> = Vec::new();
 
     std::thread::scope(|scope| {
-        let (sender, receiver) = mpsc::channel::<(usize, Result<Outcome>)>();
+        let (sender, receiver) = mpsc::channel::<(usize, Result<MutantExecution>)>();
         for (scratch, target) in &worker_dirs {
             let sender = sender.clone();
             let (next, stop, ignored) = (&next, &stop, &ignored);
@@ -5742,8 +5910,10 @@ fn execute_mutants(
                         settings.test_command,
                         settings.timeouts,
                         scratch,
+                        settings.scratch_root,
                         target,
                         ignored,
+                        settings.timing,
                     );
                     let failed = result.is_err();
                     if failed {
@@ -5760,17 +5930,17 @@ fn execute_mutants(
         let mut reported = 0;
         for (index, result) in receiver {
             match result {
-                Ok(outcome) => slots[index] = Some(outcome),
+                Ok(execution) => slots[index] = Some(execution),
                 Err(error) => {
                     stop.store(true, Ordering::SeqCst);
                     errors.push((index, error));
                 }
             }
             while errors.is_empty() {
-                let Some(Some(outcome)) = slots.get(reported) else {
+                let Some(Some(execution)) = slots.get(reported) else {
                     break;
                 };
-                if let Err(error) = on_result(&mutants[reported], outcome) {
+                if let Err(error) = on_result(&mutants[reported], &execution.outcome) {
                     stop.store(true, Ordering::SeqCst);
                     errors.push((reported, error));
                     break;
@@ -5780,14 +5950,12 @@ fn execute_mutants(
         }
     });
 
-    let scratch_root = root.join(".soro-mutants-worktree");
-    // #184: refuse to follow a symlinked scratch root out of the project.
-    pathguard::require_owned_scratch_path(&scratch_root, root)?;
-    let cleanup = if scratch_root.exists() {
-        fs::remove_dir_all(&scratch_root).with_context(|| {
+    pathguard::require_owned_scratch_path_under(settings.scratch_root, settings.scratch_root)?;
+    let cleanup = if settings.scratch_root.exists() {
+        fs::remove_dir_all(settings.scratch_root).with_context(|| {
             format!(
                 "failed to clean mutation scratch {}",
-                scratch_root.display()
+                settings.scratch_root.display()
             )
         })
     } else {
@@ -5821,12 +5989,15 @@ fn execute_mutant(
     test_command: &str,
     timeouts: Timeouts,
     scratch: &Path,
+    scratch_root: &Path,
     target_dir: &Path,
     ignored: &[PathBuf],
-) -> Result<Outcome> {
-    // #184: the scratch worktree is always owned by the project; verify that
-    // before either the pre-run clear or the post-run cleanup deletes it.
-    pathguard::require_owned_scratch_path(scratch, root)?;
+    timing: bool,
+) -> Result<MutantExecution> {
+    let total_started = Instant::now();
+
+    // #184: verify ownership before either the pre-run clear or post-run cleanup.
+    pathguard::require_owned_scratch_path_under(scratch, scratch_root)?;
     if scratch.exists() {
         fs::remove_dir_all(scratch)
             .with_context(|| format!("failed to clear scratch {}", scratch.display()))?;
@@ -5834,26 +6005,35 @@ fn execute_mutant(
     copy_project(root, scratch, ignored)?;
     apply_mutant(scratch, mutant)?;
 
-    let result = (|| -> Result<Outcome> {
+    let result = (|| -> Result<(Outcome, Option<u64>, Option<u64>)> {
         let scratch_cwd = test_dir
             .map(|dir| scratch.join(dir))
             .unwrap_or_else(|| scratch.to_path_buf());
 
+        let mut compile_ms = None;
         if let Some(compile_command) = compile_command_for(test_command) {
-            match run_process(&scratch_cwd, &compile_command, timeouts.compile, target_dir)? {
-                ProcessResult::Failed => return Ok(Outcome::Unviable),
-                ProcessResult::Timeout => return Ok(Outcome::Timeout),
+            let compile_started = Instant::now();
+            let compile_result =
+                run_process(&scratch_cwd, &compile_command, timeouts.compile, target_dir)?;
+            if timing {
+                compile_ms = Some(duration_ms(compile_started.elapsed()));
+            }
+            match compile_result {
+                ProcessResult::Failed => return Ok((Outcome::Unviable, compile_ms, None)),
+                ProcessResult::Timeout => return Ok((Outcome::Timeout, compile_ms, None)),
                 ProcessResult::Passed => {}
             }
         }
 
-        Ok(
-            match run_process(&scratch_cwd, test_command, timeouts.test, target_dir)? {
-                ProcessResult::Passed => Outcome::Survived,
-                ProcessResult::Failed => Outcome::Killed,
-                ProcessResult::Timeout => Outcome::Timeout,
-            },
-        )
+        let test_started = Instant::now();
+        let test_result = run_process(&scratch_cwd, test_command, timeouts.test, target_dir)?;
+        let test_ms = timing.then(|| duration_ms(test_started.elapsed()));
+        let outcome = match test_result {
+            ProcessResult::Passed => Outcome::Survived,
+            ProcessResult::Failed => Outcome::Killed,
+            ProcessResult::Timeout => Outcome::Timeout,
+        };
+        Ok((outcome, compile_ms, test_ms))
     })();
 
     let cleanup_result = if scratch.exists() {
@@ -5866,7 +6046,14 @@ fn execute_mutant(
     match (result, cleanup_result) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok((outcome, compile_ms, test_ms)), Ok(())) => Ok(MutantExecution {
+            outcome,
+            timing: timing.then(|| MutantTiming {
+                total_ms: duration_ms(total_started.elapsed()),
+                compile_ms,
+                test_ms,
+            }),
+        }),
     }
 }
 
@@ -6607,7 +6794,11 @@ mod tests {
 
     #[test]
     fn path_length_failure_recommends_shorter_project_or_target_directory() {
-        let error = path_io_error("copying file to", Path::new("/deep/nested/file.rs"), io::Error::from_raw_os_error(36));
+        let error = path_io_error(
+            "copying file to",
+            Path::new("/deep/nested/file.rs"),
+            io::Error::from_raw_os_error(36),
+        );
         let message = error.to_string();
         assert!(message.contains("/deep/nested/file.rs"));
         assert!(message.contains("--target-dir"));
@@ -6616,9 +6807,15 @@ mod tests {
 
     #[test]
     fn ordinary_copy_errors_keep_the_original_cause() {
-        let error = path_io_error("copying file to", Path::new("example.rs"), io::Error::from_raw_os_error(2));
+        let error = path_io_error(
+            "copying file to",
+            Path::new("example.rs"),
+            io::Error::from_raw_os_error(2),
+        );
         assert!(error.to_string().contains("example.rs"));
-        assert!(error.to_string().contains("No such file") || error.to_string().contains("cannot find"));
+        assert!(
+            error.to_string().contains("No such file") || error.to_string().contains("cannot find")
+        );
     }
 
     #[cfg(unix)]
@@ -6629,7 +6826,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let fixture = env::temp_dir().join(format!("soro-copy-mode-{}-{nonce}", std::process::id()));
+        let fixture =
+            env::temp_dir().join(format!("soro-copy-mode-{}-{nonce}", std::process::id()));
         let root = fixture.join("source");
         let destination = fixture.join("mutant");
         fs::create_dir_all(root.join("bin")).unwrap();
@@ -6637,11 +6835,24 @@ mod tests {
         fs::set_permissions(root.join("bin/run.sh"), fs::Permissions::from_mode(0o750)).unwrap();
         fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o750)).unwrap();
         copy_project(&root, &destination, &[]).unwrap();
-        assert_eq!(fs::metadata(destination.join("bin/run.sh")).unwrap().permissions().mode() & 0o777, 0o750);
-        assert_eq!(fs::metadata(destination.join("bin")).unwrap().permissions().mode() & 0o777, 0o750);
+        assert_eq!(
+            fs::metadata(destination.join("bin/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(destination.join("bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
         fs::remove_dir_all(fixture).unwrap();
     }
-
 
     #[test]
     fn machine_report_paths_use_forward_slashes() {
@@ -6828,10 +7039,12 @@ mod tests {
         let survived = MutantResult {
             mutant: mutant.clone(),
             outcome: Outcome::Survived,
+            timing: None,
         };
         let killed = MutantResult {
             mutant,
             outcome: Outcome::Killed,
+            timing: None,
         };
         let mut output = Vec::new();
         print_github_annotations(&mut output, &[survived.clone(), survived, killed]).unwrap();
@@ -6923,11 +7136,13 @@ mod tests {
                 test: 60,
             },
             &scratch,
+            &scratch,
             &target,
             &[],
+            false,
         )
         .unwrap();
-        assert_eq!(outcome, Outcome::Unviable);
+        assert_eq!(outcome.outcome, Outcome::Unviable);
         assert!(!scratch.exists(), "scratch worktree must be removed");
         assert!(fs::read_to_string(root.join("src/lib.rs"))
             .unwrap()
@@ -6950,11 +7165,13 @@ mod tests {
                 test: 60,
             },
             &scratch,
+            &scratch,
             &target,
             &[],
+            false,
         )
         .unwrap();
-        assert_eq!(outcome, Outcome::Killed);
+        assert_eq!(outcome.outcome, Outcome::Killed);
         assert!(!scratch.exists(), "scratch worktree must be removed");
         assert!(fs::read_to_string(root.join("src/lib.rs"))
             .unwrap()
@@ -7045,6 +7262,7 @@ mod tests {
         let results = [MutantResult {
             mutant,
             outcome: Outcome::Survived,
+            timing: None,
         }];
         let mut output = Vec::new();
         print_html_report(&mut output, &results).unwrap();
@@ -7092,6 +7310,7 @@ mod tests {
         .map(|outcome| MutantResult {
             mutant: report_mutant(),
             outcome,
+            timing: None,
         })
         .collect::<Vec<_>>();
         assert!(ensure_min_score(&results, Some(50.0)).is_ok());
@@ -7111,6 +7330,7 @@ mod tests {
             let results = [MutantResult {
                 mutant: report_mutant(),
                 outcome,
+                timing: None,
             }];
             let report = serde_json::to_value(test_report(&results)).unwrap();
             let example: serde_json::Value =
@@ -8474,12 +8694,14 @@ mod tests {
             "cargo test -q",
             Timeouts::resolve(30, None, None),
             &root.join(".soro-mutants-worktree"),
+            &root.join(".soro-mutants-worktree"),
             &target,
             &[],
+            false,
         )
         .expect("mutant execution should succeed");
 
-        assert!(matches!(outcome, Outcome::Survived));
+        assert!(matches!(outcome.outcome, Outcome::Survived));
         assert!(!root.join(".soro-mutants-worktree").exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -8647,7 +8869,9 @@ mod tests {
                     test_command: "cargo test -q",
                     timeouts: Timeouts::resolve(120, None, None),
                     target_dir: Some(&cache),
+                    scratch_root: &root.join(pathguard::SCRATCH_NAME),
                     jobs,
+                    timing: false,
                 },
                 &mut |mutant, outcome| {
                     reported.push((mutant.id.clone(), outcome_label(outcome)));
@@ -8656,7 +8880,10 @@ mod tests {
             )
             .expect("mutant execution should succeed");
 
-            let labels = outcomes.iter().map(outcome_label).collect::<Vec<_>>();
+            let labels = outcomes
+                .iter()
+                .map(|execution| outcome_label(&execution.outcome))
+                .collect::<Vec<_>>();
             assert_eq!(labels, ["KILLED", "SURVIVED", "SURVIVED"], "jobs={jobs}");
             assert_eq!(
                 reported,
@@ -8705,6 +8932,72 @@ mod tests {
         for invalid in ["0", "-1", "two"] {
             assert!(jobs(&["--jobs", invalid]).is_err(), "--jobs {invalid}");
         }
+    }
+
+    #[test]
+    fn timing_and_scratch_flags_are_opt_in_and_parse_together() {
+        let parsed = Cli::try_parse_from([
+            "cargo-soro-mutants",
+            "test",
+            ".",
+            "--timing",
+            "--scratch-dir",
+            "/tmp/soro-mutants-scratch",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Test {
+                timing,
+                scratch_dir,
+                ..
+            } => {
+                assert!(timing);
+                assert_eq!(
+                    scratch_dir.as_deref(),
+                    Some(Path::new("/tmp/soro-mutants-scratch"))
+                );
+            }
+            _ => unreachable!("test subcommand"),
+        }
+
+        let defaults = Cli::try_parse_from(["cargo-soro-mutants", "test", "."]).unwrap();
+        match defaults.command {
+            Commands::Test {
+                timing,
+                scratch_dir,
+                ..
+            } => {
+                assert!(!timing);
+                assert!(scratch_dir.is_none());
+            }
+            _ => unreachable!("test subcommand"),
+        }
+    }
+
+    #[test]
+    fn optional_timing_fields_serialize_only_when_enabled() {
+        let mutant = report_mutant();
+        let without = serde_json::to_value(MutantResult {
+            mutant: mutant.clone(),
+            outcome: Outcome::Survived,
+            timing: None,
+        })
+        .unwrap();
+        assert!(without.get("timing").is_none());
+
+        let with = serde_json::to_value(MutantResult {
+            mutant,
+            outcome: Outcome::Killed,
+            timing: Some(MutantTiming {
+                total_ms: 9,
+                compile_ms: Some(4),
+                test_ms: Some(3),
+            }),
+        })
+        .unwrap();
+        assert_eq!(with["timing"]["total_ms"], 9);
+        assert_eq!(with["timing"]["compile_ms"], 4);
+        assert_eq!(with["timing"]["test_ms"], 3);
     }
 
     #[test]
