@@ -340,3 +340,56 @@ fn multiline_locations_agree_across_all_report_formats() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn multiline_event_token_and_ttl_mutations_retain_original_byte_ranges() {
+    let source = concat!(
+        "pub fn mutate(env: Env, from: Address, to: Address, amount: i128) {\n",
+        "    let client = token::Client::new(&env, &from);\n",
+        "    client.transfer(\n",
+        "        &from,\n",
+        "        &to,\n",
+        "        &amount,\n",
+        "    ); // transfer tail\n",
+        "    env.events().publish(\n",
+        "        (\"transfer\",),\n",
+        "        (&from, &to),\n",
+        "    ); // event tail\n",
+        "    env.storage().instance().extend_ttl(\n",
+        "        3,\n",
+        "        9,\n",
+        "    ); // ttl tail\n",
+        "}\n"
+    );
+    let root = project(source);
+    let mutants = list(&root);
+    for operator in ["TOKEN-001", "EVENT-001", "TTL-001"] {
+        let mutant = mutants
+            .iter()
+            .find(|m| m["operator"] == operator)
+            .unwrap_or_else(|| panic!("missing {operator}: {mutants:#?}"));
+        let span = &mutant["span"];
+        let start_line = span["line"].as_u64().unwrap() as usize;
+        let end_line = span["end_line"].as_u64().unwrap() as usize;
+        assert!(end_line > start_line, "{operator} needs a multiline span");
+        let start = byte_offset(source, start_line, span["column"].as_u64().unwrap() as usize);
+        let end = byte_offset(
+            source,
+            end_line,
+            span["end_column"].as_u64().unwrap() as usize,
+        );
+        assert_eq!(&source[start..end], mutant["original"].as_str().unwrap());
+        let mutated = format!(
+            "{}{}{}",
+            &source[..start],
+            mutant["replacement"].as_str().unwrap(),
+            &source[end..]
+        );
+        assert!(mutated.starts_with(&source[..start]));
+        assert!(mutated.ends_with(&source[end..]));
+        assert!(mutated.contains("// transfer tail"));
+        assert!(mutated.contains("// event tail"));
+        assert!(mutated.contains("// ttl tail"));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
