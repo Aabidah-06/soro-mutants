@@ -2354,7 +2354,6 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         self.leave_signature(previous);
     }
 
-
     fn visit_block(&mut self, node: &'ast syn::Block) {
         let previous = self.snapshot_scope();
         visit::visit_block(self, node);
@@ -2371,10 +2370,11 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
                 is_token_client_constructor(&init.expr)
                     || is_aliased_token_constructor(&init.expr, &self.sdk_aliases)
             });
-        let contract_client = node
-            .init
-            .as_ref()
-            .is_some_and(|init| is_generated_contract_client_constructor(&init.expr));
+        let contract_client = !client
+            && node
+                .init
+                .as_ref()
+                .is_some_and(|init| is_generated_contract_client_constructor(&init.expr));
         let accessor = node
             .init
             .as_ref()
