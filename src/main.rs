@@ -1443,6 +1443,33 @@ struct AuthHelper {
     sinks: Vec<(usize, String, bool)>,
 }
 
+
+#[derive(Clone)]
+struct LexicalScope {
+    address_params: Vec<String>,
+    address_vec_params: Vec<String>,
+    address_option_params: Vec<String>,
+    token_client_vars: Vec<String>,
+    contract_client_vars: Vec<String>,
+    storage_accessor_vars: Vec<String>,
+    numeric_params: Vec<String>,
+    env_params: Vec<String>,
+}
+
+fn pattern_names(pat: &Pat) -> Vec<String> {
+    #[derive(Default)]
+    struct Names(Vec<String>);
+    impl<'ast> Visit<'ast> for Names {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            self.0.push(node.ident.to_string());
+            visit::visit_pat_ident(self, node);
+        }
+    }
+    let mut names = Names::default();
+    names.visit_pat(pat);
+    names.0
+}
+
 struct SemanticVisitor<'a> {
     source: &'a str,
     file: PathBuf,
@@ -1492,6 +1519,42 @@ impl<'a> SemanticVisitor<'a> {
             local_bindings: std::collections::HashSet::new(),
             mutants: Vec::new(),
         }
+    }
+
+
+    fn snapshot_scope(&self) -> LexicalScope {
+        LexicalScope {
+            address_params: self.address_params.clone(),
+            address_vec_params: self.address_vec_params.clone(),
+            address_option_params: self.address_option_params.clone(),
+            token_client_vars: self.token_client_vars.clone(),
+            contract_client_vars: self.contract_client_vars.clone(),
+            storage_accessor_vars: self.storage_accessor_vars.clone(),
+            numeric_params: self.numeric_params.clone(),
+            env_params: self.env_params.clone(),
+        }
+    }
+
+    fn restore_scope(&mut self, scope: LexicalScope) {
+        self.address_params = scope.address_params;
+        self.address_vec_params = scope.address_vec_params;
+        self.address_option_params = scope.address_option_params;
+        self.token_client_vars = scope.token_client_vars;
+        self.contract_client_vars = scope.contract_client_vars;
+        self.storage_accessor_vars = scope.storage_accessor_vars;
+        self.numeric_params = scope.numeric_params;
+        self.env_params = scope.env_params;
+    }
+
+    fn shadow_name(&mut self, name: &str) {
+        self.address_params.retain(|value| value != name);
+        self.address_vec_params.retain(|value| value != name);
+        self.address_option_params.retain(|value| value != name);
+        self.token_client_vars.retain(|value| value != name);
+        self.contract_client_vars.retain(|value| value != name);
+        self.storage_accessor_vars.retain(|value| value != name);
+        self.numeric_params.retain(|value| value != name);
+        self.env_params.retain(|value| value != name);
     }
 
     fn enter_signature(&mut self, sig: &Signature, body: &syn::Block) -> FunctionState {
@@ -2084,29 +2147,60 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         self.leave_signature(previous);
     }
 
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        let previous = self.snapshot_scope();
+        visit::visit_block(self, node);
+        self.restore_scope(previous);
+    }
+
     fn visit_local(&mut self, node: &'ast Local) {
-        if let Some((name, init)) = local_binding_name_and_init(node) {
-            if is_token_client_constructor(init) && !self.token_client_vars.contains(&name) {
+        // The initializer runs in the old scope; the pattern shadows it after.
+        visit::visit_local(self, node);
+        let client = node
+            .init
+            .as_ref()
+            .is_some_and(|init| is_token_client_constructor(&init.expr));
+        let contract_client = node
+            .init
+            .as_ref()
+            .is_some_and(|init| is_generated_contract_client_constructor(&init.expr));
+        let accessor = node
+            .init
+            .as_ref()
+            .is_some_and(|init| is_soroban_storage_accessor(&init.expr, &self.env_params));
+
+        for name in pattern_names(&node.pat) {
+            self.shadow_name(&name);
+        }
+        if let Some((name, _)) = local_binding_name_and_init(node) {
+            if client {
                 self.token_client_vars.push(name.clone());
             }
-
-            if is_generated_contract_client_constructor(init)
-                && !self.contract_client_vars.contains(&name)
-            {
+            if contract_client {
                 self.contract_client_vars.push(name.clone());
             }
-
-            if is_soroban_storage_accessor(init, &self.env_params)
-                && !self.storage_accessor_vars.contains(&name) {
+            if accessor {
                 self.storage_accessor_vars.push(name);
             }
         }
-
-        visit::visit_local(self, node);
+        if let Pat::Type(typed) = &node.pat {
+            if let Pat::Ident(binding) = typed.pat.as_ref() {
+                let name = binding.ident.to_string();
+                if type_is_address(&typed.ty) {
+                    self.address_params.push(name);
+                } else if type_is_env(&typed.ty) {
+                    self.env_params.push(name);
+                } else if type_is_token_client(&typed.ty) {
+                    self.token_client_vars.push(name);
+                }
+            }
+        }
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
-        let old_len = self.address_params.len();
+        // Evaluate the iterator before the loop pattern is bound.
+        visit::visit_expr(self, &node.expr);
         let loop_binding = match (node.pat.as_ref(), node.expr.as_ref()) {
             (Pat::Ident(binding), Expr::MethodCall(call))
                 if call.method == "iter" && call.args.is_empty() =>
@@ -2120,42 +2214,58 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
             }
             _ => None,
         };
-        if let Some(binding) = loop_binding {
-            if !self.address_params.contains(&binding) {
-                self.address_params.push(binding);
-            }
+        let previous = self.snapshot_scope();
+        for name in pattern_names(&node.pat) {
+            self.shadow_name(&name);
         }
-
-        visit::visit_expr_for_loop(self, node);
-        self.address_params.truncate(old_len);
+        if let Some(binding) = loop_binding {
+            self.address_params.push(binding);
+        }
+        visit::visit_pat(self, &node.pat);
+        visit::visit_block(self, &node.body);
+        self.restore_scope(previous);
     }
 
     fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
-        // Match-arm bindings are lexical: visit the scrutinee once, then visit
-        // each arm with a temporary candidate scope that is discarded before
-        // the next arm. We only infer bindings from Option<Address> parameters;
-        // arbitrary pattern type inference remains intentionally out of scope.
         visit::visit_expr(self, &node.expr);
         let option_address = receiver_ident(&node.expr)
             .is_some_and(|name| self.address_option_params.contains(&name));
 
         for arm in &node.arms {
-            let old_len = self.address_params.len();
+            let previous = self.snapshot_scope();
+            for name in pattern_names(&arm.pat) {
+                self.shadow_name(&name);
+            }
             if option_address {
                 if let Some(binding) = option_address_binding(&arm.pat) {
-                    if !self.address_params.contains(&binding) {
-                        self.address_params.push(binding);
-                    }
+                    self.address_params.push(binding);
                 }
             }
-
             visit::visit_pat(self, &arm.pat);
             if let Some((_, guard)) = &arm.guard {
                 visit::visit_expr(self, guard);
             }
             visit::visit_expr(self, &arm.body);
-            self.address_params.truncate(old_len);
+            self.restore_scope(previous);
         }
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let previous = self.snapshot_scope();
+        for pat in &node.inputs {
+            for name in pattern_names(pat) {
+                self.shadow_name(&name);
+            }
+            if let Pat::Type(typed) = pat {
+                if let Pat::Ident(binding) = typed.pat.as_ref() {
+                    if type_is_address(&typed.ty) {
+                        self.address_params.push(binding.ident.to_string());
+                    }
+                }
+            }
+        }
+        visit::visit_expr_closure(self, node);
+        self.restore_scope(previous);
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
