@@ -19,9 +19,9 @@ fn project(source: &str) -> PathBuf {
         root.join("Cargo.toml"),
         concat!(
             "[package]\n",
-            "name = \"semantic_accuracy_fixture\"\n",
-            "version = \"0.1.0\"\n",
-            "edition = \"2021\"\n\n",
+            "name = \"semantic_accuracy_fixture\"\n\n",
+            "version = \"0.1.0\"\n\n",
+            "edition = \"2021\"\n\n\n",
             "[workspace]\n",
         ),
     )
