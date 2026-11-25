@@ -205,6 +205,9 @@ pub fn scopes(owner: Address, alternate: Address, amounts: [u32; 2], option: Opt
             "substitution did not compile: {}",
             String::from_utf8_lossy(&check.stderr)
         );
+        // Restore the original source for the next mutation and avoid
+        // carrying an earlier edit into a later compile check.
+        fs::write(root.join("src/lib.rs"), source).unwrap();
     }
     fs::remove_dir_all(root).unwrap();
 }
