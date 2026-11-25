@@ -2096,7 +2096,8 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
                 self.contract_client_vars.push(name.clone());
             }
 
-            if is_soroban_storage_accessor(init) && !self.storage_accessor_vars.contains(&name) {
+            if is_soroban_storage_accessor(init, &self.env_params)
+                && !self.storage_accessor_vars.contains(&name) {
                 self.storage_accessor_vars.push(name);
             }
         }
@@ -2336,7 +2337,7 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         }
 
         if node.method == "extend_ttl"
-            && is_ttl_receiver(&node.receiver, &self.storage_accessor_vars)
+            && is_ttl_receiver(&node.receiver, &self.storage_accessor_vars, &self.env_params)
         {
             self.push_mutant(
                 "TTL-001",
@@ -2441,7 +2442,8 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         }
 
         if node.method == "require_auth"
-            && (!self.env_params.is_empty() || !self.address_params.is_empty())
+            && receiver_ident(&node.receiver)
+                .is_some_and(|name| self.address_params.contains(&name))
         {
             let receiver = receiver_ident(&node.receiver);
 
@@ -5636,7 +5638,7 @@ fn is_direct_env_storage_receiver(expr: &Expr, env_params: &[String]) -> bool {
     }
 }
 
-fn is_soroban_storage_accessor(expr: &Expr) -> bool {
+fn is_soroban_storage_accessor(expr: &Expr, env_params: &[String]) -> bool {
     match expr {
         Expr::MethodCall(call)
             if matches!(
@@ -5644,27 +5646,20 @@ fn is_soroban_storage_accessor(expr: &Expr) -> bool {
                 "instance" | "persistent" | "temporary"
             ) =>
         {
-            storage_chain_contains_storage(&call.receiver)
+            is_direct_env_storage_receiver(&call.receiver, env_params)
         }
-        Expr::Paren(paren) => is_soroban_storage_accessor(&paren.expr),
-        Expr::Reference(reference) => is_soroban_storage_accessor(&reference.expr),
+        Expr::Paren(paren) => is_soroban_storage_accessor(&paren.expr, env_params),
+        Expr::Reference(reference) => is_soroban_storage_accessor(&reference.expr, env_params),
         _ => false,
     }
 }
 
-fn storage_chain_contains_storage(expr: &Expr) -> bool {
-    match expr {
-        Expr::MethodCall(call) => {
-            call.method == "storage" || storage_chain_contains_storage(&call.receiver)
-        }
-        Expr::Paren(paren) => storage_chain_contains_storage(&paren.expr),
-        Expr::Reference(reference) => storage_chain_contains_storage(&reference.expr),
-        _ => false,
-    }
-}
-
-fn is_ttl_receiver(expr: &Expr, known_accessors: &[String]) -> bool {
-    if is_soroban_storage_accessor(expr) {
+fn is_ttl_receiver(
+    expr: &Expr,
+    known_accessors: &[String],
+    env_params: &[String],
+) -> bool {
+    if is_soroban_storage_accessor(expr, env_params) {
         return true;
     }
 
