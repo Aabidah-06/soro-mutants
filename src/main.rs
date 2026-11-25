@@ -6028,6 +6028,9 @@ fn span_to_offsets(source: &str, span: Span) -> Option<(usize, usize, SourceSpan
     let end = span.end();
     let start_byte = line_column_to_offset(source, start.line, start.column)?;
     let end_byte = line_column_to_offset(source, end.line, end.column)?;
+    if start_byte > end_byte || !source.is_char_boundary(start_byte) || !source.is_char_boundary(end_byte) {
+        return None;
+    }
 
     Some((
         start_byte,
@@ -6050,7 +6053,12 @@ fn line_column_to_offset(source: &str, target_line: usize, target_column: usize)
     for (index, line) in source.split_inclusive('\n').enumerate() {
         let line_number = index + 1;
         if line_number == target_line {
-            return (target_column <= line.len()).then_some(offset + target_column);
+            // proc_macro2 columns are UTF-8 byte based, 0-indexed. Never
+            // interpret a column as part of the line break or a codepoint.
+            let line_bytes = line.trim_end_matches(['\r', '\n']).len();
+            let absolute = offset + target_column;
+            return (target_column <= line_bytes && source.is_char_boundary(absolute))
+                .then_some(absolute);
         }
         offset += line.len();
     }
@@ -6904,13 +6912,22 @@ fn run_process(
 fn print_mutants(report: &mut dyn Write, mutants: &[Mutant]) -> Result<()> {
     writeln!(report, "Discovered {} semantic mutants\n", mutants.len())?;
     for mutant in mutants {
+        let location = if mutant.span.line == mutant.span.end_line {
+            format!("{}", mutant.span.line)
+        } else {
+            format!(
+                "{}:{}-{}:{}",
+                mutant.span.line, mutant.span.column,
+                mutant.span.end_line, mutant.span.end_column
+            )
+        };
         writeln!(
             report,
             "{} {:<8} {}:{} {}",
             mutant.id,
             mutant.operator,
             mutant.file.display(),
-            mutant.span.line,
+            location,
             mutant.description
         )?;
         writeln!(report, "    - {}", mutant.original.trim())?;
@@ -7090,14 +7107,22 @@ small { color: #516577; }
     }
     for result in results {
         let mutant = &result.mutant;
+        let location = if mutant.span.line == mutant.span.end_line {
+            format!("{}:{}", mutant.file.display(), mutant.span.line)
+        } else {
+            format!(
+                "{}:{}:{}-{}:{}",
+                mutant.file.display(), mutant.span.line, mutant.span.column,
+                mutant.span.end_line, mutant.span.end_column
+            )
+        };
         writeln!(
             report,
-            "<article><h3>{} — {} — {}</h3><small>{}:{} (function: {})</small><p>{}</p><p>Original</p><pre><code>{}</code></pre><p>Replacement</p><pre><code>{}</code></pre></article>",
+            "<article><h3>{} — {} — {}</h3><small>{} (function: {})</small><p>{}</p><p>Original</p><pre><code>{}</code></pre><p>Replacement</p><pre><code>{}</code></pre></article>",
             escape_html(&mutant.id),
             escape_html(&mutant.operator),
             outcome_label(&result.outcome),
-            escape_html(&mutant.file.to_string_lossy()),
-            mutant.span.line,
+            escape_html(&location),
             escape_html(mutant.function.as_deref().unwrap_or("unknown")),
             escape_html(&mutant.description),
             escape_html(&mutant.original),
@@ -7172,15 +7197,28 @@ fn print_markdown_report(report: &mut dyn Write, results: &[MutantResult]) -> Re
                 .description
                 .replace(['\n', '\r'], " ")
                 .replace('`', "\\`");
+            let location_label = if mutant.span.line == mutant.span.end_line {
+                format!("{}:{}", link_label, mutant.span.line)
+            } else {
+                format!(
+                    "{}:{}:{}-{}:{}",
+                    link_label, mutant.span.line, mutant.span.column,
+                    mutant.span.end_line, mutant.span.end_column
+                )
+            };
+            let fragment = if mutant.span.line == mutant.span.end_line {
+                format!("#L{}", mutant.span.line)
+            } else {
+                format!("#L{}-L{}", mutant.span.line, mutant.span.end_line)
+            };
             writeln!(
                 report,
-                "- `{}` **{}** [{}:{}]({}#L{}) — {}",
+                "- `{}` **{}** [{}]({}{}) — {}",
                 mutant.id,
                 mutant.operator,
-                link_label,
-                mutant.span.line,
+                location_label,
                 target,
-                mutant.span.line,
+                fragment,
                 description
             )?;
         }
@@ -7302,6 +7340,14 @@ fn print_sarif_report(report: &mut dyn Write, results: &[MutantResult]) -> Resul
         .map(|result| {
             let mutant = &result.mutant;
             let path = mutant.file.to_string_lossy().replace('\\', "/");
+            let mut region = serde_json::json!({
+                "startLine": mutant.span.line,
+                "startColumn": mutant.span.column
+            });
+            if mutant.span.end_line != mutant.span.line {
+                region["endLine"] = serde_json::json!(mutant.span.end_line);
+                region["endColumn"] = serde_json::json!(mutant.span.end_column);
+            }
             serde_json::json!({
                 "ruleId": mutant.operator,
                 "level": "warning",
@@ -7314,10 +7360,7 @@ fn print_sarif_report(report: &mut dyn Write, results: &[MutantResult]) -> Resul
                 "locations": [{
                     "physicalLocation": {
                         "artifactLocation": {"uri": path},
-                        "region": {
-                            "startLine": mutant.span.line,
-                            "startColumn": mutant.span.column
-                        }
+                        "region": region
                     }
                 }],
                 "properties": {
