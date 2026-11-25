@@ -1470,7 +1470,6 @@ fn pattern_names(pat: &Pat) -> Vec<String> {
     names.0
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SorobanAlias {
     Address,
@@ -1617,7 +1616,9 @@ fn is_aliased_token_constructor(
 fn type_is_sdk_storage_accessor(ty: &Type) -> bool {
     match ty {
         Type::Path(type_path) => {
-            let joined = type_path.path.segments
+            let joined = type_path
+                .path
+                .segments
                 .iter()
                 .map(|segment| segment.ident.to_string())
                 .collect::<Vec<_>>()
@@ -1635,15 +1636,18 @@ fn type_is_sdk_storage_accessor(ty: &Type) -> bool {
 }
 
 fn storage_accessor_params(sig: &Signature) -> Vec<String> {
-    sig.inputs.iter().filter_map(|input| match input {
-        FnArg::Typed(typed) if type_is_sdk_storage_accessor(&typed.ty) => {
-            match typed.pat.as_ref() {
-                Pat::Ident(binding) => Some(binding.ident.to_string()),
-                _ => None,
+    sig.inputs
+        .iter()
+        .filter_map(|input| match input {
+            FnArg::Typed(typed) if type_is_sdk_storage_accessor(&typed.ty) => {
+                match typed.pat.as_ref() {
+                    Pat::Ident(binding) => Some(binding.ident.to_string()),
+                    _ => None,
+                }
             }
-        }
-        _ => None,
-    }).collect()
+            _ => None,
+        })
+        .collect()
 }
 
 struct SemanticVisitor<'a> {
@@ -1735,7 +1739,6 @@ impl<'a> SemanticVisitor<'a> {
         self.env_params.retain(|value| value != name);
     }
 
-
     fn normalized_type(&self, ty: &Type) -> Type {
         let mut normalized = ty.clone();
         normalize_soroban_type(&mut normalized, &self.sdk_aliases);
@@ -1764,8 +1767,14 @@ impl<'a> SemanticVisitor<'a> {
                 parts.push(name);
                 parts.join("::")
             }),
-            lifecycle: std::mem::replace(&mut self.lifecycle, recognized_lifecycle(&normalized, body)),
-            address_params: std::mem::replace(&mut self.address_params, address_params(&normalized)),
+            lifecycle: std::mem::replace(
+                &mut self.lifecycle,
+                recognized_lifecycle(&normalized, body),
+            ),
+            address_params: std::mem::replace(
+                &mut self.address_params,
+                address_params(&normalized),
+            ),
             address_vec_params: std::mem::replace(
                 &mut self.address_vec_params,
                 address_vec_params(&normalized),
@@ -1783,7 +1792,10 @@ impl<'a> SemanticVisitor<'a> {
                 &mut self.storage_accessor_vars,
                 storage_accessor_params(&normalized),
             ),
-            numeric_params: std::mem::replace(&mut self.numeric_params, numeric_params(&normalized)),
+            numeric_params: std::mem::replace(
+                &mut self.numeric_params,
+                numeric_params(&normalized),
+            ),
             env_params: std::mem::replace(&mut self.env_params, env_params(&normalized)),
         }
     }
@@ -2026,8 +2038,10 @@ impl<'a> SemanticVisitor<'a> {
             {
                 continue;
             }
-            let annotated_address =
-                matches!(&local.pat, Pat::Type(typed) if type_is_address(&self.normalized_type(&typed.ty)));
+            let annotated_address = matches!(
+                &local.pat,
+                Pat::Type(typed) if type_is_address(&self.normalized_type(&typed.ty))
+            );
             let Some(turbofish_address) = stored_authority_lookup(init, &self.env_params) else {
                 continue;
             };
@@ -2353,8 +2367,10 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         let client = node
             .init
             .as_ref()
-            .is_some_and(|init| (is_token_client_constructor(&init.expr)
-                    || is_aliased_token_constructor(&init.expr, &self.sdk_aliases)));
+            .is_some_and(|init| {
+                is_token_client_constructor(&init.expr)
+                    || is_aliased_token_constructor(&init.expr, &self.sdk_aliases)
+            });
         let contract_client = node
             .init
             .as_ref()
@@ -2588,7 +2604,7 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         if node.method == "transfer"
             && node.args.len() == 3
             && (is_token_transfer_receiver(&node.receiver, &self.token_client_vars)
-                    || is_aliased_token_constructor(&node.receiver, &self.sdk_aliases))
+                || is_aliased_token_constructor(&node.receiver, &self.sdk_aliases))
         {
             if let Some(replacement) = swapped_transfer_replacement(self.source, node) {
                 self.push_mutant(
@@ -2639,8 +2655,9 @@ impl<'ast> Visit<'ast> for SemanticVisitor<'_> {
         if let Some((role_a, role_b)) =
             allowance_role_labels(&node.method.to_string(), node.args.len())
         {
-            if (is_token_transfer_receiver(&node.receiver, &self.token_client_vars)
-                    || is_aliased_token_constructor(&node.receiver, &self.sdk_aliases)) {
+            if is_token_transfer_receiver(&node.receiver, &self.token_client_vars)
+                || is_aliased_token_constructor(&node.receiver, &self.sdk_aliases)
+            {
                 self.push_allowance_role_swap(node, role_a, role_b);
             }
         }
@@ -6028,7 +6045,10 @@ fn span_to_offsets(source: &str, span: Span) -> Option<(usize, usize, SourceSpan
     let end = span.end();
     let start_byte = line_column_to_offset(source, start.line, start.column)?;
     let end_byte = line_column_to_offset(source, end.line, end.column)?;
-    if start_byte > end_byte || !source.is_char_boundary(start_byte) || !source.is_char_boundary(end_byte) {
+    if start_byte > end_byte
+        || !source.is_char_boundary(start_byte)
+        || !source.is_char_boundary(end_byte)
+    {
         return None;
     }
 
@@ -6913,7 +6933,7 @@ fn print_mutants(report: &mut dyn Write, mutants: &[Mutant]) -> Result<()> {
     writeln!(report, "Discovered {} semantic mutants\n", mutants.len())?;
     for mutant in mutants {
         let location = if mutant.span.line == mutant.span.end_line {
-            format!("{}", mutant.span.line)
+            mutant.span.line.to_string()
         } else {
             format!(
                 "{}:{}-{}:{}",
