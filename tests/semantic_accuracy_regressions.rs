@@ -17,7 +17,13 @@ fn project(source: &str) -> PathBuf {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"semantic_accuracy_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        concat!(
+            "[package]\n",
+            "name = \"semantic_accuracy_fixture\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n\n",
+            "[workspace]\n",
+        ),
     )
     .unwrap();
     fs::write(root.join("src/lib.rs"), source).unwrap();
@@ -152,11 +158,17 @@ pub fn scopes(owner: Address, alternate: Address, amounts: [u32; 2], option: Opt
         .collect();
     assert_eq!(substitutions.len(), 3, "{mutants:#?}");
     assert_eq!(
-        substitutions.iter().filter(|m| m["replacement"] == "alternate.require_auth()").count(),
+        substitutions
+            .iter()
+            .filter(|m| m["replacement"] == "alternate.require_auth()")
+            .count(),
         2
     );
     assert_eq!(
-        substitutions.iter().filter(|m| m["replacement"] == "owner.require_auth()").count(),
+        substitutions
+            .iter()
+            .filter(|m| m["replacement"] == "owner.require_auth()")
+            .count(),
         1
     );
 
@@ -164,8 +176,16 @@ pub fn scopes(owner: Address, alternate: Address, amounts: [u32; 2], option: Opt
     for mutant in substitutions {
         let span = &mutant["span"];
         let (start, end) = (
-            byte_offset(source, span["line"].as_u64().unwrap() as usize, span["column"].as_u64().unwrap() as usize),
-            byte_offset(source, span["end_line"].as_u64().unwrap() as usize, span["end_column"].as_u64().unwrap() as usize),
+            byte_offset(
+                source,
+                span["line"].as_u64().unwrap() as usize,
+                span["column"].as_u64().unwrap() as usize,
+            ),
+            byte_offset(
+                source,
+                span["end_line"].as_u64().unwrap() as usize,
+                span["end_column"].as_u64().unwrap() as usize,
+            ),
         );
         assert_eq!(&source[start..end], mutant["original"].as_str().unwrap());
         let mutated = format!(
@@ -281,22 +301,39 @@ fn multiline_locations_agree_across_all_report_formats() {
     let root = project(source);
     let mutants = list(&root);
     let auth = mutants.iter().find(|m| m["operator"] == "AUTH-001").unwrap();
-    assert_eq!(auth["span"], serde_json::json!({
-        "line": 2, "column": 5, "end_line": 3, "end_column": 6
-    }));
+    assert_eq!(
+        auth["span"],
+        serde_json::json!({
+            "line": 2, "column": 5, "end_line": 3, "end_column": 6
+        })
+    );
     assert_eq!(auth["original"], "admin.require_auth(\n    )");
     let text = run(&root, "list", &["--operator", "AUTH-001"]);
     assert!(text.contains("src/lib.rs:2:5-3:6"), "{text}");
-    let markdown = run(&root, "test", &["--operator", "AUTH-001", "--test-command", "true", "--markdown"]);
+    let markdown = run(
+        &root,
+        "test",
+        &["--operator", "AUTH-001", "--test-command", "true", "--markdown"],
+    );
     assert!(markdown.contains("[src/lib.rs:2:5-3:6](src/lib.rs#L2-L3)"), "{markdown}");
-    let html = run(&root, "test", &["--operator", "AUTH-001", "--test-command", "true", "--html"]);
+    let html = run(
+        &root,
+        "test",
+        &["--operator", "AUTH-001", "--test-command", "true", "--html"],
+    );
     assert!(html.contains("src/lib.rs:2:5-3:6"), "{html}");
-    let sarif: serde_json::Value = serde_json::from_str(
-        &run(&root, "test", &["--operator", "AUTH-001", "--test-command", "true", "--sarif"])
-    ).unwrap();
+    let sarif: serde_json::Value = serde_json::from_str(&run(
+        &root,
+        "test",
+        &["--operator", "AUTH-001", "--test-command", "true", "--sarif"],
+    ))
+    .unwrap();
     let region = &sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
-    assert_eq!(region, &serde_json::json!({
-        "startLine": 2, "startColumn": 5, "endLine": 3, "endColumn": 6
-    }));
+    assert_eq!(
+        region,
+        &serde_json::json!({
+            "startLine": 2, "startColumn": 5, "endLine": 3, "endColumn": 6
+        })
+    );
     fs::remove_dir_all(root).unwrap();
 }
